@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "e2e": "node tests/e2e/smoke.mjs",
+    "e2e:print": "node tests/e2e/print.mjs",
     "e2e:layout": "node tests/e2e/layout.mjs",
     "e2e:legacy": "node tests/e2e/legacy-open.mjs",
     "catalog": "vite-node scripts/gen-catalog.ts",
