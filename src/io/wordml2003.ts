@@ -25,6 +25,7 @@ import type { Node as PMNode } from 'prosemirror-model';
 import { importDocxZip } from './docx-import';
 import { decodeXml, parseXml, attr, kids, kid } from './xml-read';
 import { base64ToBytes, extForMime, sniffImageMime } from './serialize';
+import { esc } from './ooxml-util';
 
 const W2003 = 'http://schemas.microsoft.com/office/word/2003/wordml';
 const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
@@ -43,7 +44,6 @@ const EL_RENAME: Record<string, string> = { vmerge: 'vMerge', hmerge: 'hMerge', 
 /** Containers whose children are kept in place. */
 const UNWRAP = new Set(['sect', 'sub-section', 'pBdrGroup', 'borders', 'sdt', 'sdtContent', 'customXml']);
 
-const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const camel = (s: string) => ATTR_RENAME[s] || s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 
 interface Rel { id: string; type: string; target: string; external?: boolean }

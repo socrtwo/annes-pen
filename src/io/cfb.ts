@@ -64,19 +64,24 @@ export function openCfb(b: Uint8Array): Cfb | null {
   const secOff = (sid: number) => (sid + 1) * secSize;
   const maxSid = Math.max(0, Math.ceil((b.length - secSize) / secSize));
 
-  // FAT sectors: 109 in the header, the rest in the DIFAT chain.
+  // FAT sectors: 109 in the header, the rest in the DIFAT chain. No more are needed than it
+  // takes to map every sector in the file; a sector listed twice is read once (later copies
+  // map nothing), so a crafted DIFAT can't multiply the FAT's size.
+  const perSec = secSize / 4;
+  const maxFat = Math.ceil(maxSid / perSec);
   const fatSids: number[] = [];
-  for (let k = 0; k < 109; k++) { const s = u32(0x4c + k * 4); if (s < maxSid) fatSids.push(s); }
+  const listed = new Set<number>();
+  const addFat = (s: number) => { if (s < maxSid && fatSids.length < maxFat) { fatSids.push(listed.has(s) ? NOSTREAM : s); listed.add(s); } };
+  for (let k = 0; k < 109; k++) addFat(u32(0x4c + k * 4));
   const seen = new Set<number>();
-  for (let d = difatStart; d < maxSid && !seen.has(d) && seen.size < 1e5; ) {
+  for (let d = difatStart; d < maxSid && !seen.has(d) && fatSids.length < maxFat; ) {
     seen.add(d);
     const off = secOff(d), per = secSize / 4 - 1;
-    for (let k = 0; k < per; k++) { const s = u32(off + k * 4); if (s < maxSid) fatSids.push(s); }
+    for (let k = 0; k < per; k++) addFat(u32(off + k * 4));
     d = u32(off + per * 4);
   }
-  const perSec = secSize / 4;
   const fat = new Uint32Array(fatSids.length * perSec).fill(ENDOFCHAIN);
-  fatSids.forEach((sid, n) => { const off = secOff(sid); for (let k = 0; k < perSec; k++) fat[n * perSec + k] = u32(off + k * 4); });
+  fatSids.forEach((sid, n) => { if (sid === NOSTREAM) return; const off = secOff(sid); for (let k = 0; k < perSec; k++) fat[n * perSec + k] = u32(off + k * 4); });
 
   const chain = (start: number, table: Uint32Array, limit: number, label: string): number[] => {
     const out: number[] = [];

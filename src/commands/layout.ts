@@ -3,7 +3,7 @@ import { def } from './registry';
 import type { App } from '../app';
 import { schema } from '../editor/schema';
 import { PAGE_SIZES, pageDims } from '../editor/settings';
-import { STYLE_SETS, THEMES } from '../editor/styles';
+import { STYLE_SETS, THEMES, designLabel } from '../editor/styles';
 import { setParaAttrs, paraAttr, topLevelRange } from '../editor/ops';
 import { openDialog, toast, colorMenu } from '../ui/dialog';
 import { toUnit, fromUnit } from '../prefs';
@@ -232,13 +232,13 @@ def([
 def([
   {
     id: 'design.themes', label: 'Themes', icon: 'palette', tab: 'Design', group: 'Document Formatting', kind: 'menu', edits: true, popular: true,
-    run: (app, arg) => { const t = THEMES[arg]; if (t) app.updateSettings((s) => { s.theme = { name: arg, ...t }; }); },
-    menu: (app) => Object.keys(THEMES).map((k) => ({ id: 'design.themes', arg: k, label: `${k} — ${THEMES[k].headingFont}/${THEMES[k].bodyFont}`, checked: app.settings.theme.name === k, swatch: THEMES[k].accent[0] })),
+    run: (app, arg) => { const t = THEMES[arg]; if (t) app.updateSettings((s) => { s.theme = { name: designLabel(arg), ...t }; }); },
+    menu: (app) => Object.keys(THEMES).map((k) => ({ id: 'design.themes', arg: k, label: `${designLabel(k)} — ${THEMES[k].headingFont}/${THEMES[k].bodyFont}`, checked: designLabel(app.settings.theme.name) === designLabel(k), swatch: THEMES[k].accent[0] })),
   },
   {
     id: 'design.styleSet', label: 'Style Set', icon: 'style', tab: 'Design', group: 'Document Formatting', kind: 'gallery', edits: true, popular: true,
     run: (app, arg) => { if (arg && STYLE_SETS[arg]) app.updateSettings((s) => { s.styleSet = arg; }); },
-    menu: (app) => Object.keys(STYLE_SETS).map((k) => ({ id: 'design.styleSet', arg: k, label: k, checked: app.settings.styleSet === k, preview: `font-family:"${STYLE_SETS[k]._fonts?.[0] || 'Carlito'}"` })),
+    menu: (app) => Object.keys(STYLE_SETS).map((k) => ({ id: 'design.styleSet', arg: k, label: designLabel(k), checked: app.settings.styleSet === k, preview: `font-family:"${STYLE_SETS[k]._fonts?.[0] || 'Carlito'}"` })),
   },
   {
     id: 'design.colors', label: 'Theme Colors', icon: 'format_color_fill', tab: 'Design', group: 'Document Formatting', kind: 'menu', edits: true,
@@ -252,7 +252,7 @@ def([
       const t = THEMES[arg];
       if (t) app.updateSettings((s) => { s.theme.accent = [...t.accent]; });
     },
-    menu: () => [...Object.keys(THEMES).map((k) => ({ id: 'design.colors', arg: k, label: k, swatch: THEMES[k].accent[0] })), { separator: true }, { id: 'design.colors', arg: 'custom', label: 'Customize Colors…' }],
+    menu: () => [...Object.keys(THEMES).map((k) => ({ id: 'design.colors', arg: k, label: designLabel(k), swatch: THEMES[k].accent[0] })), { separator: true }, { id: 'design.colors', arg: 'custom', label: 'Customize Colors…' }],
   },
   {
     id: 'design.fonts', label: 'Theme Fonts', icon: 'font_download', tab: 'Design', group: 'Document Formatting', kind: 'menu', edits: true,
@@ -262,11 +262,11 @@ def([
           { key: 'h', label: 'Heading font', type: 'combo', options: ALL_FONTS, value: app.settings.theme.headingFont },
           { key: 'b', label: 'Body font', type: 'combo', options: ALL_FONTS, value: app.settings.theme.bodyFont },
         ] });
-        if (r) app.updateSettings((s) => { s.theme.headingFont = r.h; s.theme.bodyFont = r.b; s.styleSet = 'QuillPen'; });
+        if (r) app.updateSettings((s) => { s.theme.headingFont = r.h; s.theme.bodyFont = r.b; s.styleSet = 'QuillPen'; }); // rename:keep — stored key
         return;
       }
       const t = THEMES[arg];
-      if (t) app.updateSettings((s) => { s.theme.headingFont = t.headingFont; s.theme.bodyFont = t.bodyFont; s.styleSet = 'QuillPen'; });
+      if (t) app.updateSettings((s) => { s.theme.headingFont = t.headingFont; s.theme.bodyFont = t.bodyFont; s.styleSet = 'QuillPen'; }); // rename:keep — stored key
     },
     menu: () => [...Object.keys(THEMES).map((k) => ({ id: 'design.fonts', arg: k, label: `${THEMES[k].headingFont} / ${THEMES[k].bodyFont}`, preview: `font-family:"${THEMES[k].headingFont}"` })), { separator: true }, { id: 'design.fonts', arg: 'custom', label: 'Customize Fonts…' }],
   },

@@ -869,6 +869,8 @@ class DocxWriter {
     if (a.indentRight != null) p.indentRight = a.indentRight;
     if (a.indentFirst != null && !ctx.list) p.indentFirst = a.indentFirst;
     p.align = alignOut(a.align);
+    // In a w:bidi paragraph jc left/right mean leading/trailing: the model's right margin is "left".
+    if (p.bidi && (p.align === 'left' || p.align === 'right')) p.align = p.align === 'left' ? 'right' : 'left';
     if (a.outlineLevel != null && a.outlineLevel >= 1 && a.outlineLevel <= 9) p.outlineLevel = a.outlineLevel - 1;
     if (a.hidden) p.vanish = true;
     return p;
@@ -1282,7 +1284,11 @@ class DocxWriter {
           } else out += this.paragraph(child, { ...ctx, list: { numId: id, ilvl } });
         } else if (isList(child)) out += this.list(child, ctx, level + 1, id);
         else if (child.type === N.paragraph) out += this.paragraph(child, { ...ctx, listCont: { ilvl } });
-        else out += this.block(child, ctx);
+        else if (child.type === N.code_block) {
+          // Indented like the item's text, so that the importer keeps it in the item.
+          const id = this.useStyle('Code');
+          out += child.textContent.split('\n').map((line) => `<w:p><w:pPr><w:pStyle w:val="${id}"/><w:ind w:left="${ptToTwip(36 * (ilvl + 1))}"/></w:pPr>${textRun(line, '')}</w:p>`).join('');
+        } else out += this.block(child, ctx);
         first = false;
       });
     });

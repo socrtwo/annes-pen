@@ -2,7 +2,7 @@
 // checks the imported text and the notes shown, and saves a screenshot of each.
 //   npm run build && npx vite preview --port 4301 --strictPort &
 //   QF_URL=http://localhost:4301/ node tests/e2e/legacy-open.mjs [files-dir] [screenshot-dir]
-import { chromium } from 'playwright';
+import { launchChromium } from './browser.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -12,8 +12,7 @@ const shots = path.resolve(process.argv[3] || 'build/legacy-e2e-shots');
 if (!fs.existsSync(path.join(files, 'memo'))) execFileSync('npx', ['vite-node', 'tests/e2e/make-legacy-files.ts', files], { stdio: 'inherit' });
 fs.mkdirSync(shots, { recursive: true });
 
-const exe = ['/opt/pw-browsers/chromium', '/opt/pw-browsers/chromium-1194/chrome-linux/chrome'].map((p) => (fs.existsSync(p) && fs.statSync(p).isDirectory() ? path.join(p, 'chrome-linux/chrome') : p)).find((p) => fs.existsSync(p) && fs.statSync(p).isFile());
-const browser = await chromium.launch(exe ? { executablePath: exe } : {});
+const browser = await launchChromium();
 const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
 const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));

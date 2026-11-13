@@ -121,6 +121,8 @@ export async function showAiPreview(app: App, o: PreviewOptions): Promise<void> 
   let idx = 0;
   let done = false;
   let waiting = '';
+  /** Why the last request failed, shown instead of the result. */
+  let error = '';
   const out = h('div', { class: 'qf-ai-out', contenteditable: 'false' });
   const ens = h('div', { class: 'qf-ai-ens-slot' });
   const counter = h('span', { class: 'qf-help' });
@@ -130,7 +132,8 @@ export async function showAiPreview(app: App, o: PreviewOptions): Promise<void> 
     h('button', { class: 'qf-iconbtn', title: 'Next version', onclick: () => { if (idx < versions.length - 1) { idx++; render(); } } }, icon('chevron_right')));
   const refineIn = h('input', { type: 'text', class: 'qf-input', placeholder: 'Refine: e.g. shorter, more formal, mention the date…' }) as HTMLInputElement;
   const render = () => {
-    out.textContent = versions[idx] || (done ? '(empty response)' : waiting || '…');
+    out.textContent = versions[idx] || (done ? (error ? `⚠ ${error}` : '(empty response)') : waiting || '…');
+    out.classList.toggle('qf-ai-error', !versions[idx] && done && !!error);
     counter.textContent = versions.length > 1 ? `Version ${idx + 1} of ${versions.length}` : '';
     nav.style.display = versions.length > 1 ? '' : 'none';
   };
@@ -139,7 +142,7 @@ export async function showAiPreview(app: App, o: PreviewOptions): Promise<void> 
     out, ens, nav,
     o.refine ? h('div', { class: 'qf-row' }, refineIn, h('button', { class: 'qf-btn', onclick: async () => {
       if (!refineIn.value.trim() || !done) return;
-      done = false; const base = versions[idx]; versions = ['']; idx = 0; waiting = ''; clear(ens); render();
+      done = false; error = ''; const base = versions[idx]; versions = ['']; idx = 0; waiting = ''; clear(ens); render();
       try { versions = [cleanOutput(await o.refine!(base, refineIn.value.trim()), { keepMarkdown: o.markdown })]; } catch (e: any) { versions = [base]; toast(String(e?.message || e)); }
       done = true; refineIn.value = ''; render();
     } }, 'Refine')) : null,
@@ -168,13 +171,14 @@ export async function showAiPreview(app: App, o: PreviewOptions): Promise<void> 
     result: (r) => { clear(ens); if (r.ensemble) ens.append(ensembleView(r.ensemble, r.providerName)); },
   };
   const run = async () => {
-    done = false; versions = ['']; idx = 0; waiting = ''; clear(ens); render();
+    done = false; error = ''; versions = ['']; idx = 0; waiting = ''; clear(ens); render();
     try {
       const all = await o.generate((full) => { versions[0] = cleanOutput(full, { keepMarkdown: o.markdown }); render(); }, ctl.signal, gctx);
       versions = all.map((v) => cleanOutput(v, { keepMarkdown: o.markdown })).filter(Boolean);
       if (!versions.length) versions = [''];
     } catch (e: any) {
-      if (!(e instanceof AiError && e.code === 'aborted')) out.textContent = String(e?.message || e);
+      // Kept for render(), which would otherwise show "(empty response)" over it.
+      error = e instanceof AiError && e.code === 'aborted' ? 'Stopped.' : String(e?.message || e);
       versions = [''];
     }
     done = true;
@@ -188,11 +192,37 @@ export async function showAiPreview(app: App, o: PreviewOptions): Promise<void> 
 // ------------------------------------------------------------------------------------------
 // AI pane
 
-interface Turn { role: 'user' | 'assistant'; text: string; title?: string; markdown?: boolean; status?: string; ensemble?: EnsembleInfo; by?: string }
-const history: Turn[] = [];
+interface Turn { role: 'user' | 'assistant'; text: string; title?: string; markdown?: boolean; status?: string; ensemble?: EnsembleInfo; by?: string; failed?: boolean }
+/** Each document has its own conversation. */
+const histories = new WeakMap<object, Turn[]>();
+const EMPTY: Turn[] = [];
 let paneEl: HTMLElement | null = null;
 let paneApp: App | null = null;
+let paneTab: object | null = null;
 let offSettings: (() => void) | null = null;
+let offRefresh: (() => void) | null = null;
+
+function historyOf(tab: object | null | undefined): Turn[] {
+  if (!tab) return EMPTY;
+  let h = histories.get(tab);
+  if (!h) histories.set(tab, (h = []));
+  return h;
+}
+/** The conversation shown in the pane (the active document's). */
+const shown = (): Turn[] => historyOf(paneTab ?? paneApp?.tab);
+
+/** Earlier turns sent back to the AI: answered questions only (no failed, stopped or empty answers). */
+export function chatHistory(turns: Turn[]): ChatMessage[] {
+  const out: ChatMessage[] = [];
+  for (let i = 0; i < turns.length; i++) {
+    const t = turns[i];
+    if (t.role === 'assistant') { if (t.text && !t.failed) out.push({ role: 'assistant', content: t.text }); continue; }
+    const a = turns[i + 1];
+    if (a && a.role === 'assistant' && (!a.text || a.failed)) { i++; continue; }
+    out.push({ role: 'user', content: t.text });
+  }
+  return out;
+}
 
 /** Which AI (or AIs) answer, for the pane's header. */
 function paneHead(): string {
@@ -210,7 +240,7 @@ function paneHead(): string {
 export function paneResult(app: App, title: string, markdown = true): { update: (t: string) => void; status: (t: string) => void; done: (t: string, r?: ChatResult) => void } {
   app.ui.openPane('ai');
   const turn: Turn = { role: 'assistant', text: '', title, markdown };
-  history.push(turn);
+  historyOf(app.tab).push(turn);
   drawPane();
   return {
     update: (t) => { turn.text = t; drawTurnText(turn); },
@@ -220,7 +250,7 @@ export function paneResult(app: App, title: string, markdown = true): { update: 
 }
 
 function drawTurnText(turn: Turn) {
-  const el = paneEl?.querySelector(`[data-turn="${history.indexOf(turn)}"] .qf-ai-msg-text`);
+  const el = paneEl?.querySelector(`[data-turn="${shown().indexOf(turn)}"] .qf-ai-msg-text`);
   if (el) el.textContent = turn.text || turn.status || '…';
 }
 
@@ -230,6 +260,8 @@ function drawPane() {
   const log = paneEl.querySelector('.qf-ai-log') as HTMLElement;
   if (!log) return;
   clear(log);
+  paneTab = app.tab;
+  const history = shown();
   if (!history.length) {
     log.append(h('p', { class: 'qf-help' }, aiSettings().active ? 'Ask anything about this document, or use the commands on the AI tab. Results appear here with buttons to insert them.' : 'AI is not set up yet.'));
     if (!aiSettings().active) log.append(h('button', { class: 'qf-btn qf-primary', onclick: () => app.exec('ai.setup') }, 'Set Up AI…'));
@@ -254,6 +286,7 @@ async function insertTop(app: App, text: string, markdown?: boolean) {
 }
 
 async function ask(app: App, question: string, include: 'none' | 'selection' | 'document') {
+  const history = historyOf(app.tab);
   history.push({ role: 'user', text: question });
   const turn: Turn = { role: 'assistant', text: '', markdown: true };
   history.push(turn);
@@ -264,7 +297,7 @@ async function ask(app: App, question: string, include: 'none' | 'selection' | '
     const ctx = include === 'selection' && !st.selection.empty ? rangeText(st.doc, st.selection.from, st.selection.to) : documentText(app, 60000).text;
     msgs.push({ role: 'user', content: `${include === 'selection' ? 'Selected text' : 'The document'}:\n${ctx}` }, { role: 'assistant', content: 'Understood.' });
   }
-  for (const t of history.slice(0, -2).slice(-10)) msgs.push({ role: t.role, content: t.text });
+  msgs.push(...chatHistory(history.slice(0, -2)).slice(-10));
   msgs.push({ role: 'user', content: question });
   const ctl = aiBusy('AI is answering…');
   try {
@@ -272,7 +305,9 @@ async function ask(app: App, question: string, include: 'none' | 'selection' | '
     turn.text = cleanOutput(r.text, { keepMarkdown: true });
     if (r.ensemble) { turn.ensemble = r.ensemble; turn.by = r.providerName; }
   } catch (e: any) {
-    turn.text = e instanceof AiError && e.code === 'aborted' ? turn.text || '(stopped)' : `⚠ ${e?.message || e}`;
+    const stopped = e instanceof AiError && e.code === 'aborted';
+    turn.failed = !stopped || !turn.text;
+    turn.text = stopped ? turn.text || '(stopped)' : `⚠ ${e?.message || e}`;
   } finally { aiIdle(ctl); }
   drawPane();
 }
@@ -292,15 +327,18 @@ export const aiPaneDef: PaneDef = {
     const headText = h('span', null, paneHead());
     offSettings?.();
     offSettings = onAiSettingsChange(() => { headText.textContent = paneHead(); });
+    // Switching documents shows that document's conversation.
+    offRefresh?.();
+    offRefresh = app.onRefresh?.(() => { if (paneEl && app.tab !== paneTab) drawPane(); }) ?? null;
     el.append(
       h('div', { class: 'qf-ai-head qf-help' }, headText, ' ', h('button', { class: 'qf-link', onclick: () => app.exec(ensemblePlan() ? 'ai.ensembleMembers' : 'ai.providers') }, 'Change')),
       h('div', { class: 'qf-ai-log' }),
       h('div', { class: 'qf-ai-compose' }, input, h('div', { class: 'qf-row' }, include, h('span', { class: 'qf-spacer' }),
-        h('button', { class: 'qf-iconbtn', title: 'Clear conversation', onclick: () => { history.length = 0; drawPane(); } }, icon('delete_sweep')),
+        h('button', { class: 'qf-iconbtn', title: 'Clear conversation', onclick: () => { shown().length = 0; drawPane(); } }, icon('delete_sweep')),
         h('button', { class: 'qf-btn qf-primary', onclick: send }, icon('send'), ' Send'))));
     drawPane();
   },
-  onClose() { paneEl = null; offSettings?.(); offSettings = null; },
+  onClose() { paneEl = null; paneTab = null; offSettings?.(); offSettings = null; offRefresh?.(); offRefresh = null; },
 };
 
 /** Show a long result in a read-only dialog (used when the pane is too small, e.g. phones). */

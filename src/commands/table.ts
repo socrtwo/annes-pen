@@ -1,6 +1,6 @@
 /** Table Design / Table Layout contextual commands. */
 import { def } from './registry';
-import type { App } from '../app';
+import { trackPositions, type App } from '../app';
 import { TextSelection, type EditorState } from 'prosemirror-state';
 import type { Node as PMNode } from 'prosemirror-model';
 import {
@@ -213,11 +213,15 @@ def([
       const r0 = rect.top, c0 = rect.left;
       const above = nums(Array.from({ length: r0 }, (_, r) => cellText(r, c0)));
       const left = nums(Array.from({ length: c0 }, (_, c) => cellText(r0, c)));
+      const at = { from: st.selection.from, to: st.selection.to };
+      const pt = trackPositions(app);
       const res = await openDialog({ title: 'Formula', help: 'Use ABOVE, LEFT, BELOW, RIGHT, or cell refs like A1, B2 (column letter + row number). Functions: SUM, AVERAGE, MIN, MAX, PRODUCT, COUNT, ROUND, ABS.', fields: [
         { key: 'f', label: 'Formula', type: 'text', value: above.length ? '=SUM(ABOVE)' : '=SUM(LEFT)' },
         { key: 'fmt', label: 'Number format', type: 'combo', options: ['0', '0.00', '#,##0', '#,##0.00', '$#,##0.00', '0%'], value: '#,##0.00' },
       ] });
+      pt.done();
       if (!res) return;
+      if (pt.lost) { toast('The document was replaced while the dialog was open.'); return; }
       const below = nums(Array.from({ length: map.height - r0 - 1 }, (_, i) => cellText(r0 + 1 + i, c0)));
       const right = nums(Array.from({ length: map.width - c0 - 1 }, (_, i) => cellText(r0, c0 + 1 + i)));
       let expr = String(res.f).replace(/^=/, '');
@@ -225,7 +229,9 @@ def([
       expr = expr.replace(/\b([A-Z])(\d+)\b/g, (_m, col: string, row: string) => String(parseFloat(cellText(+row - 1, col.charCodeAt(0) - 65).replace(/[^\d.-]/g, '')) || 0));
       try {
         const value = formatNumberPicture(evalFormula(expr), res.fmt);
-        v(app).dispatch(app.state.tr.replaceSelectionWith(N.field.create({ type: '=', arg: expr, format: res.fmt, value, locked: true })));
+        // Where the selection was when the dialog opened, through any edits made meanwhile.
+        const from = pt.map(at.from, -1), to = Math.max(from, pt.map(at.to, 1));
+        v(app).dispatch(app.state.tr.replaceWith(from, to, N.field.create({ type: '=', arg: expr, format: res.fmt, value, locked: true })));
       } catch (e: any) { toast('Formula error: ' + e.message); }
     },
   },
@@ -248,19 +254,26 @@ def([
     id: 'table.fromText', label: 'Convert Text to Table…', icon: 'table_view', tab: 'Insert', group: 'Tables', edits: true,
     run: async (app) => {
       const st = app.state;
-      const { from, to } = topLevelRange(st);
-      const lines = st.doc.textBetween(from, to, '\n', '').split('\n').filter((l) => l.length);
+      let { from, to } = topLevelRange(st);
+      const linesIn = (d: PMNode) => d.textBetween(from, to, '\n', '').split('\n').filter((l) => l.length);
+      let lines = linesIn(st.doc);
       if (!lines.length) { toast('Select the paragraphs to convert.'); return; }
       const guess = lines[0].includes('\t') ? '\t' : lines[0].includes(',') ? ',' : lines[0].includes(';') ? ';' : ' ';
+      const pt = trackPositions(app);
       const r = await openDialog({ title: 'Convert Text to Table', fields: [
         { key: 'sep', label: 'Separate text at', type: 'radio', options: [{ value: '\t', label: 'Tabs' }, { value: ',', label: 'Commas' }, { value: ';', label: 'Semicolons' }, { value: ' ', label: 'Spaces (2 or more)' }, { value: '|', label: 'Pipes |' }], value: guess },
         { key: 'header', label: 'First row is a header', type: 'checkbox', value: true },
       ] });
+      pt.done();
       if (!r) return;
+      if (pt.lost) return;
+      // The same paragraphs, through any edits made while the dialog was open.
+      if (pt.changed) { from = pt.map(from, 1); to = Math.max(from, pt.map(to, -1)); lines = linesIn(app.state.doc); }
+      if (!lines.length) return;
       const split = (l: string) => (r.sep === ' ' ? l.split(/\s{2,}/) : l.split(r.sep)).map((x) => x.trim()).filter((x, i, arr) => !(r.sep === '|' && (i === 0 || i === arr.length - 1) && x === ''));
       const data = lines.filter((l) => !(r.sep === '|' && /^\|?\s*:?-+/.test(l))).map(split);
       const cols = Math.max(...data.map((d) => d.length));
-      v(app).dispatch(st.tr.replaceWith(from, to, createTable(data.length, cols, { header: r.header, data })));
+      v(app).dispatch(app.state.tr.replaceWith(from, to, createTable(data.length, cols, { header: r.header, data })));
     },
   },
   { id: 'table.selectTable', label: 'Select Table', icon: 'select_all', tab: 'Table', group: 'Table', ...ok, run: (app) => { const t = tableInfo(app.state)!; const map = TableMap.get(t.node); const start = t.pos + 1; v(app).dispatch(app.state.tr.setSelection(CellSelection.create(app.state.doc, start + map.map[0], start + map.map[map.map.length - 1]))); } },

@@ -18,6 +18,7 @@
  *   BIBLIOGRAPHY / TOA fields become `gen_block`s whose cache holds the cached result lines.
  */
 import JSZip from 'jszip';
+import { loadZip } from './zip';
 import { Fragment, Mark, type Node as PMNode, type NodeType } from 'prosemirror-model';
 import { schema } from '../editor/schema';
 import { defaultSettings, PAGE_SIZES, type CommentData, type DocSettings, type StyleDef, type HF } from '../editor/settings';
@@ -25,7 +26,7 @@ import { BUILTIN_STYLES, effectiveStyle, fontStack, resolveStyles } from '../edi
 import {
   ACCENT_CHARS, DATE_FIELDS, FUNCTION_NAMES, HIGHLIGHT_COLORS, KNOWN_FIELDS, NARY_CHARS, UNICODE_TO_LATEX, canonicalStyleName,
   cssBorderToOoxml, cssColorToHex, exportFontName, isBuiltinStyleName, mimeForExt, onOff, ooxmlBorderToCss,
-  ooxmlColorToCss, parseFieldInstr, parseTwips, round2, stripInvalidXml, tableStyleFor, type FieldInstr,
+  ooxmlColorToCss, parseFieldInstr, parseTwips, round2, escapeXmlText, stripInvalidXml, tableStyleFor, type FieldInstr,
 } from './ooxml-util';
 import { safeCssValue, safeNum } from '../util/sanitize';
 
@@ -1130,7 +1131,7 @@ class DocxImporter {
     const info = f.info!;
     if (f.mode === 'suppress') {
       const lines = f.result.split('\n').map((l) => l.replace(/\s+$/, '')).filter((l) => l.trim());
-      const cache = lines.map((l) => `<p>${htmlEsc(l)}</p>`).join('');
+      const cache = lines.map((l) => `<p>${escapeXmlText(l, '&#39;')}</p>`).join('');
       pb.block(S.gen_block.create({ kind: f.genKind || 'toc', options: f.genOptions, cache }));
       return;
     }
@@ -1299,12 +1300,18 @@ class DocxImporter {
     };
     gatherRows(tbl);
 
-    interface CellInfo { el: Element; col: number; span: number; vm: 'restart' | 'continue' | null; rowspan: number }
+    /** el null: an empty placeholder for w:gridBefore / w:gridAfter columns. */
+    interface CellInfo { el: Element | null; col: number; span: number; vm: 'restart' | 'continue' | null; rowspan: number }
     const rows: { el: Element; cells: CellInfo[]; header: boolean }[] = [];
+    // Spans never reach past the grid (63 columns, Word's limit, when there is none).
+    const maxCols = grid.length || 63;
+    const clampSpan = (n: number, col: number) => Math.max(1, Math.min(n, maxCols - col));
     for (const tr of rowEls) {
       const trPr = kid(tr, 'trPr');
-      let col = parseInt(val(trPr, 'gridBefore') || '0', 10) || 0;
+      let col = 0;
       const cells: CellInfo[] = [];
+      const before = Math.min(maxCols - 1, Math.max(0, parseInt(val(trPr, 'gridBefore') || '0', 10) || 0));
+      if (before > 0) { cells.push({ el: null, col, span: before, vm: null, rowspan: 1 }); col += before; }
       const tcs: Element[] = [];
       const gatherCells = (el: Element) => {
         for (const c of kids(el)) {
@@ -1316,7 +1323,7 @@ class DocxImporter {
       gatherCells(tr);
       for (const tc of tcs) {
         const tcPr = kid(tc, 'tcPr');
-        const span = Math.max(1, parseInt(val(tcPr, 'gridSpan') || '1', 10) || 1);
+        const span = clampSpan(parseInt(val(tcPr, 'gridSpan') || '1', 10) || 1, col);
         const hm = kid(tcPr, 'hMerge');
         if (hm && attr(hm, 'val') !== 'restart' && cells.length) { cells[cells.length - 1].span += span; col += span; continue; }
         const vmEl = kid(tcPr, 'vMerge');
@@ -1324,6 +1331,8 @@ class DocxImporter {
         cells.push({ el: tc, col, span, vm, rowspan: 1 });
         col += span;
       }
+      const after = Math.max(0, Math.min(maxCols - col, parseInt(val(trPr, 'gridAfter') || '0', 10) || 0));
+      if (after > 0) cells.push({ el: null, col, span: after, vm: null, rowspan: 1 });
       rows.push({ el: tr, cells, header: !!flag(trPr, 'tblHeader') });
     }
     // Rowspans: count following continue-cells in the same grid column.
@@ -1351,7 +1360,7 @@ class DocxImporter {
           const above = rows.slice(0, r).some((pr) => pr.cells.some((x) => x.col === c.col && x.vm === 'restart'));
           if (above) continue;
         }
-        const tcPr = kid(c.el, 'tcPr');
+        const tcPr = c.el ? kid(c.el, 'tcPr') : null;
         let colwidth: number[] | null = null;
         const gw = grid.slice(c.col, c.col + c.span);
         if (gw.length === c.span && gw.every((x) => x > 0)) colwidth = gw.map((x) => Math.round(x / 15));
@@ -1364,7 +1373,9 @@ class DocxImporter {
         const fill = attr(shd, 'val') === 'nil' ? null : ooxmlColorToCss(attr(shd, 'fill'));
         const va = val(tcPr, 'vAlign');
         const borders = bordersJson(kid(tcPr, 'tcBorders'));
-        const content = leadParagraph(this.blocksOf(c.el));
+        // A cell may start with a nested table (block+), so no paragraph is added in front of it.
+        const blocks = c.el ? this.blocksOf(c.el) : [];
+        const content = blocks.length ? blocks : [emptyPara()];
         const type = isHeader ? S.table_header : S.table_cell;
         cellNodes.push(type.create({
           colspan: c.span, rowspan: c.rowspan, colwidth,
@@ -1413,7 +1424,8 @@ class DocxImporter {
   // Assembly: lists, code blocks, rules, sections
 
   assemble(items: Item[]): PMNode[] {
-    const flat: { node: PMNode; list?: ListInfo; listCont?: boolean }[] = [];
+    /** indented: a code block indented like list text (written for a code block inside a list item). */
+    const flat: { node: PMNode; list?: ListInfo; listCont?: boolean; indented?: boolean }[] = [];
     // Merge "Code" paragraphs into code blocks, detect horizontal rules.
     for (let k = 0; k < items.length; k++) {
       const it = items[k];
@@ -1430,7 +1442,7 @@ class DocxImporter {
         if (prev && !prev.list && prev.node.type === S.code_block) {
           const text = prev.node.textContent + '\n' + line;
           prev.node = S.code_block.create(null, text ? schema.text(text) : null);
-        } else flat.push({ node: S.code_block.create(null, line ? schema.text(line) : null) });
+        } else flat.push({ node: S.code_block.create(null, line ? schema.text(line) : null), indented: (n.attrs.indentLeft || 0) > 0 });
         continue;
       }
       if (!it.list && n.type === S.paragraph && n.childCount === 0 && n.attrs.border) {
@@ -1450,7 +1462,20 @@ class DocxImporter {
       if (stack.length) lastItem(stack[stack.length - 1]).push(node); else out.push(node);
     };
     const closeAll = () => { while (stack.length) closeTop(); };
-    for (const it of flat) {
+    // A table or code block followed (past other such blocks) by an item of the same list belongs to
+    // the item before it: Word has no other way to put one inside a list item.
+    const inItem = (n: PMNode) => n.type === S.table || n.type === S.code_block;
+    const nextNum: (string | null)[] = new Array(flat.length).fill(null);
+    for (let k = flat.length - 2; k >= 0; k--) {
+      const nx = flat[k + 1];
+      nextNum[k] = nx.list ? nx.list.numId : !nx.listCont && inItem(nx.node) ? nextNum[k + 1] : null;
+    }
+    for (let k = 0; k < flat.length; k++) {
+      const it = flat[k];
+      if (!it.list && !it.listCont && stack.length && inItem(it.node) && (it.indented || nextNum[k] === stack[0].numId)) {
+        lastItem(stack[stack.length - 1]).push(it.node);
+        continue;
+      }
       if (it.list) {
         const { numId, ilvl } = it.list;
         const def = this.levelDef(numId, ilvl);
@@ -1651,6 +1676,8 @@ function parsePPr(pPr: Element | null): Record<string, any> {
   if (!pPr) return a;
   const jc = val(pPr, 'jc');
   if (jc) a.align = jc === 'both' ? 'justify' : jc === 'distribute' ? 'distribute' : jc === 'center' ? 'center' : jc === 'right' || jc === 'end' ? 'right' : 'left';
+  // In a w:bidi paragraph left/start is the leading (right) side and right/end the trailing side.
+  if (jc && flag(pPr, 'bidi') && (a.align === 'left' || a.align === 'right')) a.align = a.align === 'left' ? 'right' : 'left';
   const ind = kid(pPr, 'ind');
   if (ind) {
     const left = ptAttr(ind, 'left') ?? ptAttr(ind, 'start');
@@ -1846,10 +1873,6 @@ function chooseAlternate(alt: Element): Element {
   return fallback || choices[0] || alt;
 }
 
-function htmlEsc(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
 /** Structural safety net: fix any content that does not fit the schema. */
 function repair(node: PMNode): PMNode {
   if (node.isText || node.isLeaf) return node;
@@ -1996,7 +2019,7 @@ function plainMath(e: Element | null): string {
 
 /** Import a .docx / .docm / .dotx / .dotm file into an Anne's Pen document. */
 export async function importDocx(data: ArrayBuffer, name: string): Promise<PMNode> {
-  return importDocxZip(await JSZip.loadAsync(data), name);
+  return importDocxZip(await loadZip(data), name);
 }
 
 /** Import an already-opened (or synthesized) WordprocessingML package. */

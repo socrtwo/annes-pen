@@ -6,7 +6,7 @@
 // File access is limited to files the user opened or saved through a dialog, or opened the app
 // with, so document content cannot use the bridge to read or overwrite arbitrary files.
 'use strict';
-const { app, BrowserWindow, protocol, net, ipcMain, dialog, shell, clipboard, safeStorage, powerSaveBlocker, Menu } = require('electron');
+const { app, BrowserWindow, protocol, net, ipcMain, dialog, shell, clipboard, safeStorage, powerSaveBlocker, Menu, session } = require('electron');
 const path = require('node:path');
 // The data folder keeps the app's former name (QuillPen) so settings, drafts and keys stay where earlier versions put them. // rename:keep
 app.setPath('userData', path.join(app.getPath('appData'), 'QuillPen')); // rename:keep
@@ -28,6 +28,11 @@ const SCHEME = 'app';
 // The page's origin keeps the app's former name so settings, drafts and keys stored by earlier
 // versions stay readable.
 const ORIGIN = `${SCHEME}://quillforge`; // rename:keep
+const ORIGIN_HOST = 'quillforge'; // rename:keep
+/** Whether a URL belongs to the app itself (app://quillforge/...), compared by parts, not by prefix. */
+function isAppUrl(u) {
+  try { const x = new URL(u); return x.protocol === SCHEME + ':' && x.host === ORIGIN_HOST; } catch { return false; }
+}
 const OPENABLE = ['docx', 'docm', 'dotx', 'dotm', 'doc', 'dot', 'wbk', 'asd', 'odt', 'ott', 'fodt', 'rtf', 'html', 'htm', 'md', 'markdown', 'txt', 'epub', 'qpd', 'qpde', 'json', // rename:keep — Anne's Pen was named QuillForge; its .qfd/.qfde files still open
   // Legacy word processors (opened by content, so the extension is only a hint)
   'wpd', 'wp', 'wp4', 'wp5', 'wp6', 'wpt', 'wps', 'wri', 'lwp', 'sam', 'mcw', 'cwk', 'wn', 'ws', 'ws4', 'ws5', 'ws6', 'ws7', 'xy', 'xyw', 'rft', 'dca', 'hwp',
@@ -49,21 +54,32 @@ let wakeId = -1;
 // Files the renderer may read and write
 
 const grantsFile = () => path.join(app.getPath('userData'), 'granted-files.json');
-let grants = new Set();
+const GRANT_DAYS = 30; // a file not opened or saved for this long must be opened through a dialog again
+/** path -> time it was last granted (ms) */
+let grants = new Map();
 function loadGrants() {
-  try { grants = new Set(JSON.parse(fs.readFileSync(grantsFile(), 'utf8'))); } catch { grants = new Set(); }
+  grants = new Map();
+  try {
+    const saved = JSON.parse(fs.readFileSync(grantsFile(), 'utf8'));
+    const now = Date.now();
+    // Earlier versions stored a plain list of paths: those count as granted now.
+    const entries = Array.isArray(saved) ? saved.map((p) => [p, now]) : Object.entries(saved);
+    for (const [p, t] of entries) if (typeof p === 'string' && typeof t === 'number' && now - t < GRANT_DAYS * 86400000) grants.set(p, t);
+  } catch { /* none yet */ }
 }
 function grant(p) {
-  grants.add(path.resolve(p));
+  const key = path.resolve(p);
+  grants.delete(key);
+  grants.set(key, Date.now());
   // Keep the most recent 200 (enough for the recent-files list).
-  const list = [...grants].slice(-200);
-  grants = new Set(list);
-  try { fs.writeFileSync(grantsFile(), JSON.stringify(list)); } catch { /* read-only profile */ }
+  grants = new Map([...grants].slice(-200));
+  try { fs.writeFileSync(grantsFile(), JSON.stringify(Object.fromEntries(grants)), { mode: 0o600 }); } catch { /* read-only profile */ }
 }
 function grantedPath(uri) {
   if (typeof uri !== 'string' || !uri.startsWith('file:')) throw new Error('Not a file address');
   const p = path.resolve(fileURLToPath(uri));
-  if (!grants.has(p)) throw new Error('Anne\'s Pen has no permission for this file; open it again.');
+  const t = grants.get(p);
+  if (t === undefined || Date.now() - t >= GRANT_DAYS * 86400000) throw new Error('Anne\'s Pen has no permission for this file; open it again.');
   return p;
 }
 const MIME = { csv: 'text/csv', eml: 'message/rfc822', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', odt: 'application/vnd.oasis.opendocument.text', rtf: 'application/rtf', html: 'text/html', htm: 'text/html', md: 'text/markdown', txt: 'text/plain', epub: 'application/epub+zip', doc: 'application/msword', json: 'application/json' };
@@ -126,6 +142,51 @@ function unseal(rec) {
   if (!rec) return null;
   return rec.enc ? safeStorage.decryptString(Buffer.from(rec.v, 'base64')) : rec.v;
 }
+// Only the AI settings keep secrets here (src/ai/store.ts: "ai.key.<provider>").
+function secureKey(key) {
+  const k = String(key);
+  if (!/^ai\.[\w.-]{1,120}$/.test(k)) throw new Error('Refused');
+  return k;
+}
+
+// ------------------------------------------------------------------------------------------
+// Hosts the qf:http bridge may reach. The built-in AI providers (keep in step with the baseUrl
+// values in src/ai/providers.ts; tests/unit/fix-e.test.ts checks this) are allowed; any other https
+// host (a custom server, Ollama behind a reverse proxy) is allowed once the user confirms it here,
+// in the main process, so page content cannot widen the list by itself.
+
+const AI_HOSTS = [
+  'openrouter.ai', 'generativelanguage.googleapis.com', 'api.groq.com', 'api.mistral.ai', 'api.cerebras.ai',
+  'api.sambanova.ai', 'api.z.ai', 'api.cohere.ai', 'api.openai.com', 'api.anthropic.com', 'api.deepseek.com',
+  'api.x.ai', 'api.perplexity.ai', 'api.together.xyz', 'api.fireworks.ai', 'router.huggingface.co',
+  'api.moonshot.ai', 'dashscope-intl.aliyuncs.com', 'integrate.api.nvidia.com', 'api.cloudflare.com',
+];
+const AI_HOST_PATTERNS = [/^[a-z0-9-]+\.openai\.azure\.com$/, /^bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com$/];
+const hostsFile = () => path.join(app.getPath('userData'), 'allowed-hosts.json');
+let userHosts = null;
+function knownHost(host) {
+  if (AI_HOSTS.includes(host) || AI_HOST_PATTERNS.some((r) => r.test(host))) return true;
+  if (!userHosts) { try { userHosts = new Set(JSON.parse(fs.readFileSync(hostsFile(), 'utf8'))); } catch { userHosts = new Set(); } }
+  return userHosts.has(host);
+}
+const asking = new Map();
+async function allowHost(host) {
+  if (knownHost(host)) return true;
+  if (!asking.has(host)) {
+    asking.set(host, dialog.showMessageBox(win, {
+      type: 'question', buttons: ['Allow', 'Deny'], defaultId: 1, cancelId: 1, title: 'AI server',
+      message: `Allow Anne's Pen to send AI requests to ${host}?`,
+      detail: 'Allow this only if you set up this server in the AI settings. Your documents and API key are sent to it.',
+    }).then((r) => {
+      asking.delete(host);
+      if (r.response !== 0) return false;
+      userHosts.add(host);
+      try { fs.writeFileSync(hostsFile(), JSON.stringify([...userHosts])); } catch { /* read-only profile */ }
+      return true;
+    }));
+  }
+  return asking.get(host);
+}
 
 // ------------------------------------------------------------------------------------------
 // OAuth loopback (OpenRouter PKCE), as on Android: one-shot listener on 127.0.0.1 only
@@ -139,7 +200,7 @@ function stopLoop() { if (loop) { clearTimeout(loop.timer); try { loop.server.cl
 const safeUrl = (u) => typeof u === 'string' && /^(https?|mailto|tel|ftp|sms|geo):/i.test(u.trim());
 function handle(name, fn) {
   ipcMain.handle('qf:' + name, async (e, opts) => {
-    if (!win || e.sender !== win.webContents || !e.senderFrame || !e.senderFrame.url.startsWith(ORIGIN)) throw new Error('Refused');
+    if (!win || e.sender !== win.webContents || !e.senderFrame || !isAppUrl(e.senderFrame.url)) throw new Error('Refused');
     return fn(opts || {});
   });
 }
@@ -189,9 +250,11 @@ function registerIpc() {
     if (on && wakeId < 0) wakeId = powerSaveBlocker.start('prevent-display-sleep');
     if (!on && wakeId >= 0) { powerSaveBlocker.stop(wakeId); wakeId = -1; }
   });
-  handle('secureSet', async ({ key, value }) => { const o = readSecure(); o[String(key)] = seal(String(value)); writeSecure(o); });
-  handle('secureGet', async ({ key }) => { try { return { value: unseal(readSecure()[String(key)]) }; } catch { return { value: null }; } });
-  handle('secureRemove', async ({ key }) => { const o = readSecure(); delete o[String(key)]; writeSecure(o); });
+  handle('secureSet', async ({ key, value }) => { const k = secureKey(key); const o = readSecure(); o[k] = seal(String(value)); writeSecure(o); });
+  handle('secureGet', async ({ key }) => { const k = secureKey(key); try { return { value: unseal(readSecure()[k]) }; } catch { return { value: null }; } });
+  handle('secureRemove', async ({ key }) => { const k = secureKey(key); const o = readSecure(); delete o[k]; writeSecure(o); });
+  // false when no OS keychain is available (some Linux desktops): keys are then stored unencrypted.
+  handle('secureInfo', async () => ({ encrypted: safeStorage.isEncryptionAvailable() }));
   handle('readClipboard', async () => ({ text: clipboard.readText() }));
   handle('writeClipboard', async ({ text }) => { clipboard.writeText(String(text ?? '')); });
   handle('startLoopback', async ({ timeoutMs, successHtml, path: want }) => {
@@ -231,7 +294,9 @@ function registerIpc() {
     return err ? { ok: false, error: err, app: label } : { ok: true, app: label };
   });
   handle('http', async ({ url, method, headers, data }) => {
-    if (typeof url !== 'string' || !/^https:\/\//i.test(url)) throw new Error('Only https requests are allowed');
+    let host;
+    try { const u = new URL(String(url)); if (u.protocol !== 'https:') throw new Error(); host = u.hostname.toLowerCase(); } catch { throw new Error('Only https requests are allowed'); }
+    if (!(await allowHost(host))) throw new Error(`Requests to ${host} are not allowed`);
     const res = await net.fetch(url, { method: method || 'GET', headers: headers || {}, body: data == null ? undefined : typeof data === 'string' ? data : JSON.stringify(data) });
     return { status: res.status, text: await res.text() };
   });
@@ -240,12 +305,13 @@ function registerIpc() {
 // ------------------------------------------------------------------------------------------
 // Window
 
-// Content Security Policy for the app. 'unsafe-eval' is needed by user macros (Developer tab);
-// cdn.jsdelivr.net and wasm are for the optional on-device AI model; http to localhost is for
-// Ollama and LM Studio. Inline scripts and plugins are never allowed.
+// Content Security Policy for the app. 'unsafe-eval' is needed by user macros (Developer tab, which
+// run through new Function); the jsDelivr package paths (pinned versions, src/ai/local.ts) and wasm are
+// for the optional on-device AI model; http to localhost is for Ollama and LM Studio. Inline
+// scripts and plugins are never allowed. Keep in step with the meta CSP in index.html.
 const CSP = [
   "default-src 'self'",
-  "script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval' blob: https://cdn.jsdelivr.net",
+  "script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval' blob: https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0/ https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0-dev.20260416-b7804b056c/dist/ https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.0-dev.20251116-b39e144322/dist/",
   "worker-src 'self' blob:",
   "connect-src 'self' https: http://localhost:* http://127.0.0.1:* data: blob:",
   "img-src 'self' data: blob: https:",
@@ -254,6 +320,7 @@ const CSP = [
   "font-src 'self' data:",
   "object-src 'none'",
   "base-uri 'self'",
+  "form-action 'none'",
   "frame-src 'none'",
 ].join('; ');
 
@@ -303,7 +370,7 @@ function createWindow() {
   });
   // Links open in the system browser; the window never navigates away from the app.
   win.webContents.setWindowOpenHandler(({ url }) => { if (safeUrl(url)) void shell.openExternal(url); return { action: 'deny' }; });
-  win.webContents.on('will-navigate', (e, url) => { if (!url.startsWith(ORIGIN)) { e.preventDefault(); if (safeUrl(url)) void shell.openExternal(url); } });
+  win.webContents.on('will-navigate', (e, url) => { if (!isAppUrl(url)) { e.preventDefault(); if (safeUrl(url)) void shell.openExternal(url); } });
   // The page asks before unloading with unsaved documents: confirm here, as the browser would.
   win.webContents.on('will-prevent-unload', (e) => {
     const choice = dialog.showMessageBoxSync(win, { type: 'question', buttons: ['Close without saving', 'Cancel'], defaultId: 1, cancelId: 1, title: 'Unsaved changes', message: 'Some documents have unsaved changes. Close Anne\'s Pen anyway?' });
@@ -321,7 +388,18 @@ app.on('second-instance', (_e, argv) => {
 // macOS: files opened from Finder (before or after launch).
 app.on('open-file', (e, p) => { e.preventDefault(); if (app.isReady()) openExternalFile(p); else pendingLaunch = p; });
 
+// Browser permissions: only what the app uses (clipboard, full screen, the microphone for
+// dictation), and only for the app's own pages. Everything else is denied.
+const PERMISSIONS = new Set(['clipboard-read', 'clipboard-sanitized-write', 'fullscreen', 'media']);
+function permitted(permission, url, details) {
+  if (!PERMISSIONS.has(permission) || !isAppUrl(url)) return false;
+  if (permission === 'media') return !!details && Array.isArray(details.mediaTypes) && details.mediaTypes.length > 0 && details.mediaTypes.every((t) => t === 'audio');
+  return true;
+}
+
 app.whenReady().then(() => {
+  session.defaultSession.setPermissionRequestHandler((wc, permission, cb, details) => cb(permitted(permission, (details && details.requestingUrl) || wc.getURL(), details)));
+  session.defaultSession.setPermissionCheckHandler((_wc, permission, origin, details) => permitted(permission, (details && details.requestingUrl) || origin, permission === 'media' ? { mediaTypes: details && details.mediaType ? [details.mediaType] : [] } : details));
   loadGrants();
   const p = pendingLaunch || fileFromArgs(process.argv);
   if (p) { grant(p); pendingLaunch = p; }

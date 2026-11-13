@@ -19,7 +19,10 @@ export const LOCAL_MODELS: LocalModel[] = [
   { id: 'onnx-community/Llama-3.2-1B-Instruct-q4f16', label: 'Llama 3.2 1B Instruct (needs WebGPU)', size: '≈ 1.24 GB', note: 'Noticeably better writing; only for devices with WebGPU and plenty of storage.' },
 ];
 
-const TRANSFORMERS_URL = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0';
+// Pinned version, loaded without a Subresource Integrity check: a worker's module import cannot
+// carry one, and the library itself loads ONNX Runtime from jsDelivr at run time. The Content
+// Security Policy (index.html, electron/main.cjs) allows only these exact package paths.
+const TRANSFORMERS_URL = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0/dist/transformers.min.js';
 
 const WORKER_SRC = `
 import { pipeline, TextStreamer, InterruptableStoppingCriteria, env } from '${TRANSFORMERS_URL}';

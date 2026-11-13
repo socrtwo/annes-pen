@@ -4,7 +4,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 const call = (name) => (opts) => ipcRenderer.invoke('qf:' + name, opts);
-const methods = ['openDocument', 'saveAs', 'writeUri', 'readUri', 'print', 'share', 'getLaunchFile', 'keepAwake', 'secureSet', 'secureGet', 'secureRemove', 'readClipboard', 'writeClipboard', 'startLoopback', 'stopLoopback', 'openExternal', 'openWith', 'http'];
+const methods = ['openDocument', 'saveAs', 'writeUri', 'readUri', 'print', 'share', 'getLaunchFile', 'keepAwake', 'secureSet', 'secureGet', 'secureRemove', 'secureInfo', 'readClipboard', 'writeClipboard', 'startLoopback', 'stopLoopback', 'openExternal', 'openWith', 'http'];
 
 const api = { platform: process.platform };
 for (const m of methods) api[m] = call(m);

@@ -1,10 +1,9 @@
 // Spelling Dictionaries wizard, end to end: downloads the real French dictionary (network needed),
 // uses it for the document, checks French spelling with Hunspell, then removes it.
-import { chromium } from 'playwright';
+import { launchChromium } from './browser.mjs';
 import fs from 'node:fs';
 const URL = process.env.QF_URL || 'http://localhost:4173/';
-const exe = ['/opt/pw-browsers/chromium-1194/chrome-linux/chrome', '/opt/pw-browsers/chromium'].find((p) => fs.existsSync(p) && fs.statSync(p).isFile());
-const browser = await chromium.launch(exe ? { executablePath: exe } : {});
+const browser = await launchChromium();
 // QF_IGNORE_HTTPS_ERRORS=1 for sandboxes whose HTTPS proxy Chromium does not trust.
 const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, ignoreHTTPSErrors: !!process.env.QF_IGNORE_HTTPS_ERRORS });
 const errors = [];

@@ -198,7 +198,7 @@ export function buildPlugins(hooks: SetupHooks): Plugin[] {
     columnResizing({ cellMinWidth: 24 }),
     tableEditing(),
     tableFix,
-    trackPlugin({ author: hooks.author() }),
+    trackPlugin({ author: hooks.author(), getAuthor: hooks.author }),
     paginationPlugin(hooks.pageConfig),
     ...decos.filter((p) => !completion.includes(p)),
   ];

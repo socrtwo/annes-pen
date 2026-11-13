@@ -607,7 +607,8 @@ describe('DOCX import of hand-built documents', () => {
     expect(span.attrs).toMatchObject({ rowspan: 2, colwidth: [100], background: '#ffff00', valign: 'bottom' });
     expect(table.child(1).childCount).toBe(1);
     const cellWithTable = table.child(1).child(0);
-    expect(cellWithTable.firstChild!.type.name).toBe('paragraph');
+    // table_cell content is block+: a cell that starts with a nested table keeps it first.
+    expect(cellWithTable.firstChild!.type.name).toBe('table');
     expect(find(cellWithTable, (n) => n.type === N.table)!.textContent).toBe('nested');
 
     // Controls, alternate content, revisions, math

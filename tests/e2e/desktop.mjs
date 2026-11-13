@@ -43,8 +43,12 @@ try {
   check('refuses plain-http requests', /Only https/.test(http), http);
 
   // Secure storage round trip.
-  const v = await page.evaluate(async () => { await window.quillDesktop.secureSet({ key: 't', value: 'sk-test' }); const r = await window.quillDesktop.secureGet({ key: 't' }); await window.quillDesktop.secureRemove({ key: 't' }); return r.value; });
+  const v = await page.evaluate(async () => { await window.quillDesktop.secureSet({ key: 'ai.key.test', value: 'sk-test' }); const r = await window.quillDesktop.secureGet({ key: 'ai.key.test' }); await window.quillDesktop.secureRemove({ key: 'ai.key.test' }); return r.value; });
   check('secure storage', v === 'sk-test', String(v));
+  const other = await page.evaluate(async () => { try { await window.quillDesktop.secureGet({ key: 'prefs' }); return 'read'; } catch (e) { return String(e.message); } });
+  check('secure storage holds only AI keys', /Refused/.test(other), other);
+  const info = await page.evaluate(() => window.quillDesktop.secureInfo());
+  check('reports whether keys are encrypted', typeof info.encrypted === 'boolean', JSON.stringify(info));
 
   // Spelling worker and dictionaries load under app://.
   const spell = await page.evaluate(async () => {

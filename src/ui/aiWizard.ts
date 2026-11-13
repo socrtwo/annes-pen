@@ -17,7 +17,7 @@ import { aiSettings, saveAiSettings, getApiKey, setApiKey, deleteApiKey, maskKey
 import { costNote, MIN_MEMBERS, MAX_MEMBERS, type EnsembleMode } from '../ai/ensemble';
 import type { Field } from './dialog';
 import { listModels, pickModels, chat, AiError } from '../ai/client';
-import { openExternal, readClipboardText, writeClipboardText, onAppResume, isNative, isCapacitor } from '../platform/native';
+import { openExternal, readClipboardText, writeClipboardText, onAppResume, isNative, isCapacitor, secureStorageEncrypted } from '../platform/native';
 
 const SECTIONS: { title: string; help: string; ids: string[] }[] = [
   { title: 'Free, no account', help: 'Runs on this device. Nothing you write leaves it.', ids: ['device', 'builtin'] },
@@ -39,7 +39,7 @@ export async function openAiSetup(app: App, opts: { provider?: string; reason?: 
     reset();
     clear(root);
     if (opts.reason) root.append(h('p', { class: 'qf-ai-reason' }, opts.reason));
-    root.append(h('p', { class: 'qf-help' }, 'Pick where QuillPen\'s AI features should run. You can add several and switch at any time (AI ▸ Providers & Models).'));
+    root.append(h('p', { class: 'qf-help' }, 'Pick where Anne\'s Pen\'s AI features should run. You can add several and switch at any time (AI ▸ Providers & Models).'));
     const s = aiSettings();
     for (const sec of SECTIONS) {
       root.append(h('h3', null, sec.title), h('p', { class: 'qf-help' }, sec.help));
@@ -113,6 +113,9 @@ export async function openAiSetup(app: App, opts: { provider?: string; reason?: 
     if (p.needsKey || p.id === 'custom' || p.id === 'lmstudio' || p.id === 'ollama') {
       root.append(h('label', { class: 'qf-field' }, h('span', null, p.keyLabel || 'API key'), h('div', { class: 'qf-row' }, keyInput, showBtn, pasteBtn)));
       void getApiKey(p.id).then((k) => { if (k) { keyInput.placeholder = `Saved key ${maskKey(k)} (leave empty to keep)`; } });
+      const plainNote = h('p', { class: 'qf-hint', hidden: true }, 'API keys are stored unencrypted on this computer (no system keychain is available).');
+      root.append(plainNote);
+      void secureStorageEncrypted().then((enc) => { plainNote.hidden = enc; });
     }
     const watch = h('input', { type: 'checkbox', checked: aiSettings().clipboardWatch, onchange: () => saveAiSettings((s) => { s.clipboardWatch = watch.checked; }) }) as HTMLInputElement;
     if (p.needsKey) root.append(h('label', { class: 'qf-check' }, watch, ' When I come back to Anne\'s Pen, look for the copied key in the clipboard'));

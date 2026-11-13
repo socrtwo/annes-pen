@@ -90,6 +90,15 @@ export function formatPageNumber(n: number, fmt: string | null): string {
   }
 }
 
+/**
+ * A physical 1-based page as the document numbers it: the page-numbering start and format
+ * applied. Footers, PAGE, PAGEREF, the TOC and cross-references all use this.
+ */
+export function displayPage(page: number, settings: DocSettings, fmt?: string | null): string {
+  const start = Number(settings.pageNumber?.start);
+  return formatPageNumber(page + (Number.isFinite(start) ? Math.trunc(start) : 1) - 1, fmt || settings.pageNumber?.format || 'decimal');
+}
+
 /** Safe arithmetic evaluator for "=" formula fields (numbers, + - * / ^ %, parentheses, SUM/AVERAGE/MIN/MAX/ROUND/ABS). */
 export function evalFormula(expr: string, vars: Record<string, number> = {}): number {
   const src = expr.replace(/\s+/g, '');
@@ -216,7 +225,7 @@ export function computeFields(ctx: FieldContext, onlyRange?: { from: number; to:
         case 'CREATEDATE': v = formatDate(new Date(ctx.created || Date.now()), format || 'M/d/yyyy'); break;
         case 'SAVEDATE': v = ctx.saved ? formatDate(new Date(ctx.saved), format || 'M/d/yyyy') : '(not saved)'; break;
         case 'PRINTDATE': v = formatDate(now, format || 'M/d/yyyy'); break;
-        case 'PAGE': v = formatPageNumber(ctx.pageOf(pos) + (s.pageNumber.start - 1), format || s.pageNumber.format); break;
+        case 'PAGE': v = displayPage(ctx.pageOf(pos), s, format); break;
         case 'NUMPAGES': v = formatPageNumber(ctx.pages, format); break;
         case 'NUMWORDS': v = String(countWords(text)); break;
         case 'NUMCHARS': v = String(text.replace(/\s/g, '').length); break;
@@ -232,7 +241,7 @@ export function computeFields(ctx: FieldContext, onlyRange?: { from: number; to:
         case 'USERNAME': v = ctx.userName; break;
         case 'USERINITIALS': v = ctx.userInitials; break;
         case 'REF': v = bookmarkInfo(ctx.doc, arg)?.text ?? 'Error! Reference source not found.'; break;
-        case 'PAGEREF': { const b = bookmarkInfo(ctx.doc, arg); v = b ? String(ctx.pageOf(b.pos)) : 'Error! Bookmark not defined.'; break; }
+        case 'PAGEREF': { const b = bookmarkInfo(ctx.doc, arg); v = b ? displayPage(ctx.pageOf(b.pos), s, format) : 'Error! Bookmark not defined.'; break; }
         case 'STYLEREF': {
           let found = '';
           ctx.doc.nodesBetween(0, pos, (n) => { if (n.type === schema.nodes.paragraph && n.attrs.style === arg) found = n.textContent; return true; });
@@ -270,7 +279,7 @@ export function expandTokens(template: string, ctx: { page: number; pages: numbe
   return template.replace(/\{([A-Z=]+)(?::([^}]*))?\}/g, (_m, t: string, arg?: string) => {
     const s = ctx.settings;
     switch (t) {
-      case 'PAGE': return formatPageNumber(ctx.page + s.pageNumber.start - 1, arg || s.pageNumber.format);
+      case 'PAGE': return displayPage(ctx.page, s, arg);
       case 'NUMPAGES': return formatPageNumber(ctx.pages, arg || null);
       case 'DATE': return formatDate(new Date(), arg || 'M/d/yyyy');
       case 'TIME': return formatDate(new Date(), arg || 'h:mm am/pm');

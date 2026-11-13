@@ -15,7 +15,8 @@ import { launchFile, onFileOpened, onBackButton, isNative, isDesktop, isCapacito
 import { closeMenus, inDialog, toast } from './ui/dialog';
 import { installScrollCues } from './ui/scrollcue';
 import { embedModeFrom } from './embed/embed';
-import { kvKeys } from './util/store';
+import { orphanedDrafts, startSession, endSession } from './util/store';
+import { PREFS_KEY, mergePrefs } from './prefs';
 import { allCommands, getCommand } from './commands/registry';
 
 installFonts();
@@ -66,11 +67,20 @@ async function start() {
       toast(`OpenRouter sign-in did not complete: ${e?.message || e}`, { ms: 10000 });
     }
   }
+  startSession();
   const { openBuffer } = await import('./commands/file');
+  // Installed web app: files opened with it from the system (manifest file_handlers).
+  const lq = (window as unknown as { launchQueue?: { setConsumer(fn: (p: { files: readonly { getFile(): Promise<File> }[] }) => void): void } }).launchQueue;
+  lq?.setConsumer(async (p) => {
+    for (const h of p.files || []) {
+      try { const f = await h.getFile(); await openBuffer(app, await f.arrayBuffer(), f.name, null); } catch (e: any) { toast(`Could not open the file: ${e?.message || e}`); }
+    }
+  });
   const lf = await launchFile();
   if (lf) await openBuffer(app, lf.data, lf.name, lf.uri);
   onFileOpened((f) => openBuffer(app, f.data, f.name, f.uri));
-  const drafts = await kvKeys('draft:');
+  // Drafts of documents still open in another window are not offered.
+  const drafts = await orphanedDrafts((k) => app.docs.some((d) => 'draft:' + d.id === k));
   if (drafts.length) toast(`${drafts.length} unsaved document(s) can be recovered.`, { action: 'Recover', onAction: () => app.exec('file.recover'), ms: 8000 });
   if (app.prefs.firstRun && !lf) setTimeout(() => app.ui.tour(), 600);
 }
@@ -92,6 +102,18 @@ onBackButton(() => {
   app.saveDrafts();
   return false;
 });
+
+// Preferences saved in another window: merged, so this window's next save keeps what that one added.
+window.addEventListener('storage', (e) => {
+  if (e.key !== PREFS_KEY || !e.newValue || app.embedded) return;
+  try {
+    Object.assign(app.prefs, mergePrefs(app.prefs, JSON.parse(e.newValue)));
+    app.rebuildKeyIndex();
+    app.ui.applyPrefs();
+    app.ui.rebuild();
+  } catch { /* a damaged value: keep this window's */ }
+});
+window.addEventListener('pagehide', () => endSession());
 
 window.addEventListener('beforeunload', (e) => {
   app.saveDrafts();

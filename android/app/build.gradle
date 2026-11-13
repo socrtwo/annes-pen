@@ -1,24 +1,34 @@
 apply plugin: 'com.android.application'
 
 // ---------------------------------------------------------------------------
-// Versioning: versionName comes from the root package.json, versionCode from
-// the VERSION_CODE environment variable (CI passes the workflow run number).
+// Versioning: versionName comes from the root package.json (or VERSION_NAME),
+// versionCode from the VERSION_CODE environment variable, which CI derives
+// from the version (scripts/android-version-code.mjs, docs/ANDROID.md).
 // ---------------------------------------------------------------------------
 def rootPackageJson = new groovy.json.JsonSlurper().parse(file('../../package.json'))
-def appVersionName = rootPackageJson.version.toString()
+def appVersionName = (System.getenv('VERSION_NAME') ?: rootPackageJson.version.toString()).trim()
 def appVersionCode = (System.getenv('VERSION_CODE') ?: '1').trim().toInteger()
 
 // ---------------------------------------------------------------------------
-// Release signing: read from environment variables when present. Without
-// them, release builds are signed with the standard debug keystore so CI
-// always produces an installable (sideload/testing only) APK. Google Play
-// requires a real upload key - see docs/ANDROID.md.
+// Release signing: read from environment variables. Without them a release
+// build fails, unless ALLOW_DEBUG_SIGNING=true (branch CI, local testing):
+// then it is signed with the standard debug keystore (sideload/testing
+// only). Google Play requires a real upload key - see docs/ANDROID.md.
 // ---------------------------------------------------------------------------
 def releaseKeystorePath = System.getenv('ANDROID_KEYSTORE_PATH')
 def hasReleaseKeystore = releaseKeystorePath != null && !releaseKeystorePath.trim().isEmpty() &&
         new File(releaseKeystorePath.trim()).isFile()
+def allowDebugSigning = (System.getenv('ALLOW_DEBUG_SIGNING') ?: '').trim() == 'true'
 if (!hasReleaseKeystore) {
-    logger.lifecycle('Anne\'s Pen: ANDROID_KEYSTORE_PATH not set or missing - release build will be signed with the DEBUG key (sideloading/testing only).')
+    if (allowDebugSigning) {
+        logger.lifecycle('Anne\'s Pen: ANDROID_KEYSTORE_PATH not set or missing - release build will be signed with the DEBUG key (ALLOW_DEBUG_SIGNING=true; sideloading/testing only).')
+    } else {
+        gradle.taskGraph.whenReady { graph ->
+            if (graph.allTasks.any { it.name.toLowerCase().contains('release') }) {
+                throw new GradleException('Anne\'s Pen: release signing keystore missing (set ANDROID_KEYSTORE_PATH and the password variables, or ALLOW_DEBUG_SIGNING=true for a debug-signed test build).')
+            }
+        }
+    }
 }
 
 android {
@@ -87,12 +97,3 @@ dependencies {
 }
 
 apply from: 'capacitor.build.gradle'
-
-try {
-    def servicesJSON = file('google-services.json')
-    if (servicesJSON.text) {
-        apply plugin: 'com.google.gms.google-services'
-    }
-} catch(Exception e) {
-    logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")
-}

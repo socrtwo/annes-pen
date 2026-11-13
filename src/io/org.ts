@@ -46,7 +46,7 @@ class OrgReader {
         return { mark: /^[a-z]+:/i.test(target) && !/^file:/.test(target) ? linkMark(target) : linkMark(/^#|\*/.test(target) ? '#' + target.replace(/^[#*]/, '') : target), inner: desc };
       } },
       { re: /\[fn:([\w-]*):([^\]]+)\]/, run: (m) => [S.footnote.create({ text: this.plain(m[2]) })] },
-      { re: /\[fn:([\w-]+)\]/, run: (m) => [S.footnote.create({ text: this.plain(this.notes.get(m[1]) || '') })] },
+      { re: /\[fn:([\w-]+)\]/, run: (m) => (this.noteBusy.has(m[1]) ? m[0] : [S.footnote.create({ text: this.noteText(m[1]) })]) },
       { re: /\\\(([\s\S]+?)\\\)/, run: (m) => [S.math_inline.create({ latex: m[1].trim() })] },
       { re: /\$([^$\s](?:[^$]*?[^$\s])?)\$(?![\w])/, run: (m) => [S.math_inline.create({ latex: m[1] })] },
       emph('=', () => MK.code.create()),
@@ -57,7 +57,7 @@ class OrgReader {
       emph('+', () => MK.strike.create()),
       { re: /\^\{([^}]*)\}/, run: (m) => ({ mark: MK.sup.create(), inner: m[1] }) },
       { re: /_\{([^}]*)\}/, run: (m) => ({ mark: MK.sub.create(), inner: m[1] }) },
-      { re: /(https?:\/\/[^\s<>\]]+[^\s<>\].,;:!?)])/, notAfter: /[\w/[]/, run: (m) => ({ mark: linkMark(m[1]), inner: m[1] }) },
+      { re: /(https?:\/\/[^\s<>\]]+[^\s<>\].,;:!?)])/, notAfter: /[\w/[]/, run: (m) => ({ mark: linkMark(m[1]), inner: m[1], raw: true }) },
       { re: /\\\\$/, run: () => [S.hard_break.create()] },
       { re: /---/, run: () => '—' },
       { re: /--/, run: () => '–' },
@@ -66,6 +66,18 @@ class OrgReader {
   }
 
   private plain(t: string): string { return this.inline(t).map((n) => n.textContent).join(''); }
+
+  /** A footnote's text; a note citing itself (directly or via others) stays a literal "[fn:x]". */
+  private noteBusy = new Set<string>();
+  private noteCache = new Map<string, string>();
+  private noteText(id: string): string {
+    let t = this.noteCache.get(id);
+    if (t != null) return t;
+    this.noteBusy.add(id);
+    try { t = this.plain(this.notes.get(id) || ''); } finally { this.noteBusy.delete(id); }
+    this.noteCache.set(id, t);
+    return t;
+  }
 
   inline(t: string, marks: readonly Mark[] = []): PMNode[] {
     return parseInline(t, this.rules, marks);

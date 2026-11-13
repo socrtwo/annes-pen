@@ -11,7 +11,7 @@
 // Scenarios: phone portrait 412x915 (24 px status bar, 48 px navigation bar), small phone 320x640, landscape
 // 915x412 (navigation bar on the right), and portrait with the on-screen keyboard open (the WebView shrinks to
 // 412x560 and Capacitor reports a bottom inset of 0 while the keyboard is up).
-import { chromium } from 'playwright';
+import { launchChromium } from './browser.mjs';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -45,8 +45,7 @@ if (!URL) {
   URL = `http://localhost:${port}/`;
   for (let i = 0; i < 120; i++) { try { if ((await fetch(URL)).ok) break; } catch { /* starting */ } await new Promise((r) => setTimeout(r, 500)); }
 }
-const exe = ['/opt/pw-browsers/chromium', '/opt/pw-browsers/chromium-1194/chrome-linux/chrome'].find((p) => fs.existsSync(p));
-const browser = await chromium.launch(exe ? { executablePath: exe } : {});
+const browser = await launchChromium();
 
 /** Runs in the page: measures every visible overlay surface and returns layout defects. */
 function measure({ sc, frame }) {

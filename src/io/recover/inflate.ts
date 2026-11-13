@@ -18,6 +18,8 @@ export interface InflateResult {
   isCorrupt: boolean;
   /** Number of damaged regions skipped by resynchronization. */
   gaps?: number;
+  /** Input bytes used, through the end of the last decoded block (the deflate stream's end when it finished). */
+  consumed?: number;
 }
 
 export interface InflateOptions {
@@ -38,7 +40,12 @@ export interface InflateOptions {
   strictBlocks?: boolean;
   /** Called at the start of each decoded block (diagnostics). */
   onBlock?: (bitPos: number, outLen: number) => void;
+  /** Output limit for this call (at most 256 MB); output beyond it is cut and reported as corrupt. */
+  maxOutput?: number;
 }
+
+/** A sensible per-call output limit for a compressed input of n bytes: 64× the input, at least 16 MB. */
+export const inflateLimit = (n: number) => Math.max(n * 64, 16 * 1024 * 1024);
 
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);
@@ -124,13 +131,19 @@ class Out {
   windowStart = 0;
   /** True once a resync has dropped data: references before windowStart become placeholders. */
   lossy = false;
-  constructor(public placeholder: number, initial: number) { this.data = new Uint8Array(Math.max(1024, Math.min(initial, 1 << 24))); }
+  /** Set when the data is damaged but decoding carried on (stored block with a bad NLEN). */
+  damaged = false;
+  max: number;
+  constructor(public placeholder: number, initial: number, max = MAX_OUT) {
+    this.max = Math.max(1, Math.min(max, MAX_OUT));
+    this.data = new Uint8Array(Math.max(1024, Math.min(initial, 1 << 24, this.max)));
+  }
   need(n: number): void {
     if (this.len + n <= this.data.length) return;
-    if (this.len + n > MAX_OUT) throw new Corrupt();
+    if (this.len + n > this.max) throw new Corrupt();
     let size = this.data.length * 2;
     while (size < this.len + n) size *= 2;
-    const next = new Uint8Array(Math.min(size, MAX_OUT));
+    const next = new Uint8Array(Math.min(size, this.max));
     next.set(this.data.subarray(0, this.len));
     this.data = next;
   }
@@ -145,6 +158,8 @@ function block(s: Bits, o: Out, strict: boolean): number {
     s.align();
     if (s.pos + 4 > s.src.length) throw new Corrupt();
     const n = s.src[s.pos] | (s.src[s.pos + 1] << 8);
+    // NLEN must be LEN's complement; a mismatch is damage, but the bytes are still kept.
+    if ((s.src[s.pos + 2] | (s.src[s.pos + 3] << 8)) !== (~n & 0xffff)) o.damaged = true;
     s.pos += 4;
     const avail = Math.min(n, s.src.length - s.pos);
     o.need(avail);
@@ -225,7 +240,7 @@ function looksLikeText(u8: Uint8Array, from: number, to: number): boolean {
 }
 
 export function immortalInflate(input: Uint8Array, opts: InflateOptions = {}): InflateResult {
-  const o = new Out(opts.placeholder ?? 0x20, input.length * 4);
+  const o = new Out(opts.placeholder ?? 0x20, input.length * 4, opts.maxOutput);
   let s = new Bits(input);
   let corrupted = false, gaps = 0;
   const totalBits = input.length * 8;
@@ -274,5 +289,5 @@ export function immortalInflate(input: Uint8Array, opts: InflateOptions = {}): I
     if (!found) { o.len = keep; break; }
     if (fin) break;
   }
-  return { data: o.data.slice(0, o.len), isCorrupt: corrupted, gaps };
+  return { data: o.data.slice(0, o.len), isCorrupt: corrupted || o.damaged, gaps, consumed: Math.min(input.length, Math.ceil(s.bitPos() / 8)) };
 }

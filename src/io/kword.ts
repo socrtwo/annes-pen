@@ -15,7 +15,7 @@
  * and footers. Not mapped: absolute frame positions, frame text flow between frames.
  */
 import type { Mark, Node as PMNode } from 'prosemirror-model';
-import JSZip from 'jszip';
+import { loadZip } from './zip';
 import { schema } from '../editor/schema';
 import { PAGE_SIZES, type StyleDef } from '../editor/settings';
 import { gunzip, untar } from './archive';
@@ -364,7 +364,7 @@ export async function importKword(data: ArrayBuffer, name: string): Promise<PMNo
   const files = new Map<string, Uint8Array>();
   let main: Uint8Array | null = null;
   if (u8[0] === 0x50 && u8[1] === 0x4b) {
-    const zip = await JSZip.loadAsync(data);
+    const zip = await loadZip(data);
     const tasks: Promise<void>[] = [];
     zip.forEach((p, f) => { if (!f.dir) tasks.push(f.async('uint8array').then((b) => { files.set(p, b); })); });
     await Promise.all(tasks);

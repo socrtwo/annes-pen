@@ -74,7 +74,7 @@ export const PROVIDERS: ProviderDef[] = [
     links: { signup: 'https://openrouter.ai/', keys: 'https://openrouter.ai/settings/keys', billing: 'https://openrouter.ai/settings/credits', free: 'https://openrouter.ai/models?max_price=0', docs: 'https://openrouter.ai/docs' },
     free: 'free', freeNote: 'Free models (":free" and the openrouter/free router): 20 requests per minute, 50 per day (1,000 per day after a one-time $10 credit purchase). One-click sign-in returns a key automatically. Paid models from every major lab with credits.',
     keyViewable: false, models: { fast: 'openrouter/free', quality: 'openrouter/auto' }, cors: 'yes', vision: true,
-    extraHeaders: { 'HTTP-Referer': 'https://github.com/socrtwo/QuillPen', 'X-Title': 'Anne\'s Pen' },
+    extraHeaders: { 'HTTP-Referer': 'https://github.com/socrtwo/annes-pen', 'X-Title': 'Anne\'s Pen' },
   },
   {
     id: 'gemini', name: 'Google Gemini API', kind: 'gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', needsKey: true,

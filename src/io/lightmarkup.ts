@@ -14,8 +14,8 @@ export interface InlineRule {
   re: RegExp;
   /** Character class that must not precede the match (constrained markup), e.g. /\w/. */
   notAfter?: RegExp;
-  /** Produce output for a match: a mark wrapping parsed inner text, literal text, or nodes. */
-  run: (m: RegExpExecArray, marks: readonly Mark[], parse: (text: string, marks: readonly Mark[]) => PMNode[]) => PMNode[] | { mark: Mark | Mark[] | null; inner: string } | string;
+  /** Produce output for a match: a mark wrapping parsed inner text (literal when `raw`), literal text, or nodes. */
+  run: (m: RegExpExecArray, marks: readonly Mark[], parse: (text: string, marks: readonly Mark[]) => PMNode[]) => PMNode[] | { mark: Mark | Mark[] | null; inner: string; raw?: boolean } | string;
 }
 
 /** Parse inline markup with rules; text between matches is literal. */
@@ -40,7 +40,9 @@ export function parseInline(text: string, rules: InlineRule[], marks: readonly M
         let ms = marks;
         const add = Array.isArray(res.mark) ? res.mark : res.mark ? [res.mark] : [];
         for (const mk of add) ms = mk.addToSet(ms);
-        for (const n of parse(res.inner, ms)) buf.node(n);
+        // Inner text that didn't shrink would re-match the same rule forever: keep it literal.
+        if (res.raw || res.inner.length >= m[0].length) buf.text(res.inner, ms);
+        else for (const n of parse(res.inner, ms)) buf.node(n);
       }
       i += m[0].length;
       continue outer;

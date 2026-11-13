@@ -45,7 +45,7 @@ function b64(s: string): Uint8Array {
   try { return bytes(atob(clean)); } catch { return new Uint8Array(0); }
 }
 function qp(s: string): Uint8Array {
-  return bytes(s.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16))));
+  return bytes(s.replace(/=[ \t]*\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16))));
 }
 
 interface Part { headers: Map<string, string>; body: string }
@@ -58,15 +58,47 @@ function splitHeaders(raw: string): Part {
   const headers = new Map<string, string>();
   for (const line of head.replace(/\r?\n[ \t]+/g, ' ').split(/\r?\n/)) {
     const i = line.indexOf(':');
-    if (i > 0) { const k = line.slice(0, i).trim().toLowerCase(); if (!headers.has(k)) headers.set(k, line.slice(i + 1).trim()); }
+    if (i > 0) { const k = line.slice(0, i).trim().toLowerCase(); if (!headers.has(k)) headers.set(k, rawHeader(line.slice(i + 1).trim())); }
   }
   return { headers, body };
 }
 
+const utf8Strict = new TextDecoder('utf-8', { fatal: true });
+/** Header text was read as Latin-1; raw 8-bit headers are nearly always UTF-8, so decode them as such when they are valid. */
+function rawHeader(v: string): string {
+  if (!/[\x80-\xff]/.test(v)) return v;
+  try { return utf8Strict.decode(bytes(v)); } catch { return v; }
+}
+
+/** RFC 2231 extended value: charset'language'percent-encoded bytes. */
+function extValue(v: string): string {
+  const m = /^([\w.:-]*)'[^']*'(.*)$/.exec(v);
+  if (!m) return v;
+  const raw = bytes(m[2].replace(/%([0-9A-Fa-f]{2})/g, (_x, h: string) => String.fromCharCode(parseInt(h, 16))));
+  return charsetDecode(raw, m[1] || 'utf-8');
+}
+
+/** Body pieces of a multipart: delimiters are whole lines "--boundary" (or "--boundary--" to close). */
+function multipartPieces(body: string, boundary: string): string[] {
+  const re = new RegExp(`^--${boundary.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(--)?[ \\t]*\\r?$`, 'gm');
+  const pieces: string[] = [];
+  let from = -1;
+  for (let m; (m = re.exec(body)); ) {
+    // The line break before a delimiter belongs to it.
+    if (from >= 0) pieces.push(body.slice(from, m.index).replace(/\r?\n$/, ''));
+    if (m[1]) { from = -1; break; }
+    from = m.index + m[0].length;
+    if (body[from] === '\n') from++;
+    if (re.lastIndex === m.index) re.lastIndex++;
+  }
+  if (from >= 0) pieces.push(body.slice(from));
+  return pieces;
+}
+
 const param = (v: string, name: string) => {
-  const m = new RegExp(`(?:^|;)\\s*${name}\\*?=\\s*(?:"([^"]*)"|([^;\\s]*))`, 'i').exec(v);
-  const r = m ? m[1] ?? m[2] : '';
-  return /^[\w-]+''/.test(r) ? decodeURIComponent(r.replace(/^[\w-]+''/, '')) : decodeWords(r);
+  const m = new RegExp(`(?:^|;)\\s*${name}(\\*?)=\\s*(?:"([^"]*)"|([^;\\s]*))`, 'i').exec(v.slice(0, 65536));
+  const r = m ? m[2] ?? m[3] : '';
+  return m?.[1] || /^[\w-]+'[^']*'/.test(r) ? extValue(r) : decodeWords(r);
 };
 
 function partBytes(p: Part): Uint8Array {
@@ -76,7 +108,7 @@ function partBytes(p: Part): Uint8Array {
   return bytes(p.body);
 }
 
-export function parseMime(raw: string): Message {
+export function parseMime(raw: string, depth = 0): Message {
   const top = splitHeaders(raw);
   const h = top.headers;
   const msg: Message = {
@@ -92,11 +124,10 @@ export function parseMime(raw: string): Message {
     if (type.startsWith('multipart/')) {
       const boundary = param(ct, 'boundary');
       if (!boundary) return;
-      const pieces = p.body.split(new RegExp(`\\r?\\n?--${boundary.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:--)?[ \\t]*\\r?\\n?`));
-      for (const piece of pieces.slice(1)) if (piece.trim()) walk(splitHeaders(piece), depth + 1);
+      for (const piece of multipartPieces(p.body, boundary)) if (piece.trim()) walk(splitHeaders(piece), depth + 1);
       return;
     }
-    if (type === 'message/rfc822' && !disp.startsWith('attachment')) { const inner = parseMime(latin1(partBytes(p))); if (!msg.text && !msg.html) { msg.text = inner.text; msg.html = inner.html; } msg.attachments.push(...inner.attachments); return; }
+    if (type === 'message/rfc822' && !disp.startsWith('attachment')) { const inner = parseMime(latin1(partBytes(p)), depth + 1); if (!msg.text && !msg.html) { msg.text = inner.text; msg.html = inner.html; } msg.attachments.push(...inner.attachments); return; }
     const data = partBytes(p);
     const cid = (p.headers.get('content-id') || '').replace(/[<>]/g, '');
     const loc = p.headers.get('content-location') || '';
@@ -114,7 +145,7 @@ export function parseMime(raw: string): Message {
     }
     msg.attachments.push({ name: fname || `(unnamed ${type})`, type, size: data.length, data, cid });
   };
-  walk(top, 0);
+  walk(top, depth);
   return msg;
 }
 
@@ -274,11 +305,26 @@ function tnefProps(d: Uint8Array): Map<number, string | Uint8Array | number> {
 
 const fmtSize = (n: number) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : n >= 1024 ? `${Math.round(n / 1024)} KB` : `${n} bytes`);
 
+/** Remove <script> and <style> elements (a linear scan; an unclosed one keeps the rest). */
+function stripScripts(html: string): string {
+  const open = /<(script|style)\b/gi;
+  let out = '', last = 0;
+  for (let m; (m = open.exec(html)); ) {
+    const close = new RegExp(`</${m[1]}\\s*>`, 'gi');
+    close.lastIndex = m.index + m[0].length;
+    const c = close.exec(html);
+    if (!c) break;
+    out += html.slice(last, m.index);
+    last = open.lastIndex = c.index + c[0].length;
+  }
+  return out + html.slice(last);
+}
+
 async function bodyBlocks(b: DocBuilder, m: Message): Promise<void> {
   if (m.html) {
     const { htmlToBlocks } = await import('../html');
     let html = m.html.replace(/(src|background)\s*=\s*(["'])(cid:[^"']+|[^"']+)\2/gi, (all, attr, q, url) => { const d = m.inline.get(url) || m.inline.get(url.replace(/^cid:/, 'cid:')); return d ? `${attr}=${q}${d}${q}` : all; });
-    html = html.replace(/<(script|style)[\s\S]*?<\/\1>/gi, '');
+    html = stripScripts(html);
     try { for (const node of htmlToBlocks(html)) b.block(node); return; } catch { /* fall back to text */ }
   }
   if (m.rtf && !m.text?.trim()) {
@@ -322,6 +368,38 @@ async function messageInto(b: DocBuilder, m: Message, withHeader: boolean): Prom
   }
 }
 
+/** Apple Mail .emlx: a byte count line, that many bytes of message, then a property list. */
+function emlxMessage(raw: string): string {
+  const m = /^(\d+)[ \t]*\r?\n/.exec(raw);
+  if (!m) return raw;
+  const n = parseInt(m[1], 10), body = raw.slice(m[0].length);
+  if (n > 0 && n <= body.length) return body.slice(0, n);
+  // A wrong count: drop a trailing property list only.
+  const plist = /\r?\n<\?xml[^\n]*\r?\n(?:<!DOCTYPE plist[^\n]*\r?\n)?<plist\b[\s\S]*$/.exec(body);
+  return plist ? body.slice(0, plist.index) : body;
+}
+
+/** "From " separator lines: at the start or after a blank line, "From sender date". */
+const FROM_LINE = /^From \S+ +(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b|\d{4}-\d\d-\d\d|\S.*\d\d:\d\d)/;
+
+/** Split an mbox mailbox into messages (unescaping ">From " lines). */
+export function mboxMessages(raw: string): string[] {
+  const lines = raw.split('\n');
+  const msgs: string[] = [];
+  let cur: string[] | null = null;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.startsWith('From ') && (i === 0 || (!lines[i - 1].replace(/\r$/, '') && FROM_LINE.test(l)))) {
+      if (cur) msgs.push(cur.join('\n'));
+      cur = [];
+      continue;
+    }
+    (cur ??= []).push(l);
+  }
+  if (cur) msgs.push(cur.join('\n'));
+  return msgs.map((s) => s.replace(/^>(>*From )/gm, '$1')).filter((s) => s.trim());
+}
+
 export async function importEmail(data: ArrayBuffer, name: string, kind: string): Promise<PMNode> {
   const u8 = u8a(data);
   const b = new DocBuilder();
@@ -329,9 +407,9 @@ export async function importEmail(data: ArrayBuffer, name: string, kind: string)
   if (kind === 'msg') { const m = parseMsg(u8); b.property('title', m.subject); await messageInto(b, m, true); return b.build(); }
   if (kind === 'tnef') { const m = parseTnef(u8); b.property('title', m.subject); await messageInto(b, m, true); return b.build(); }
   let raw = latin1(u8);
-  if (kind === 'emlx') raw = raw.replace(/^\d+[ \t]*\r?\n/, '').replace(/<\?xml[\s\S]*$/, '');
+  if (kind === 'emlx') raw = emlxMessage(raw);
   if (kind === 'mbox') {
-    const msgs = raw.split(/\r?\n(?=From [^\r\n]*\r?\n)/).map((s) => s.replace(/^From [^\r\n]*\r?\n/, '').replace(/^>(>*From )/gm, '$1')).filter((s) => s.trim());
+    const msgs = mboxMessages(raw);
     for (let i = 0; i < Math.min(msgs.length, 500); i++) {
       if (i) b.sectionBreak('nextPage');
       await messageInto(b, parseMime(msgs[i]), true);

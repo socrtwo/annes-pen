@@ -122,7 +122,7 @@ export function defaultSettings(): DocSettings {
     sources: [],
     citationStyle: 'APA',
     styles: {},
-    styleSet: 'QuillPen',
+    styleSet: 'QuillPen', // rename:keep — stored key of the default style set
     theme: { name: 'Anne\'s Pen', headingFont: 'Carlito', bodyFont: 'Carlito', accent: ['#2b579a', '#c0504d', '#9bbb59', '#8064a2', '#4bacc6', '#f79646'] },
     pageColor: null,
     watermark: null,

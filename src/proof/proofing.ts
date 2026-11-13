@@ -213,23 +213,38 @@ const GRAMMAR_RULES: { re: RegExp; msg: string; fix?: (m: RegExpExecArray) => st
 ];
 
 export class Proofer {
-  private timer: any = null;
+  // One timer per tab, so scheduling one tab never cancels another tab's pending check.
+  private timers = new Map<DocTab, ReturnType<typeof setTimeout>>();
+  /** Tabs that asked for a check while another was running; each is checked once it ends. */
+  private queued = new Set<DocTab>();
   private running = false;
   constructor(private app: App) {}
 
+  private closed(tab: DocTab | undefined): boolean {
+    return !tab?.view || (tab.view as any).isDestroyed || !this.app.docs.includes(tab);
+  }
+
+  /** Drop a tab's pending check (call when the tab closes). */
+  forget(tab: DocTab): void {
+    clearTimeout(this.timers.get(tab));
+    this.timers.delete(tab);
+    this.queued.delete(tab);
+  }
+
   schedule(tab: DocTab = this.app.active, delay = 1200) {
     // Closed tabs and destroyed views are never proofed (or rescheduled) again.
-    if (!tab?.view || (tab.view as any).isDestroyed || !this.app.docs.includes(tab)) return;
+    if (this.closed(tab)) { if (tab) this.forget(tab); return; }
     if (!this.app.prefs.spellcheck && !this.app.prefs.grammar) {
       if ((proofKey.getState(tab.view.state)?.issues.length || 0) > 0) tab.view.dispatch(tab.view.state.tr.setMeta(proofKey, []).setMeta('addToHistory', false));
       return;
     }
-    clearTimeout(this.timer);
-    this.timer = setTimeout(() => this.run(tab), delay);
+    clearTimeout(this.timers.get(tab));
+    this.timers.set(tab, setTimeout(() => { this.timers.delete(tab); void this.run(tab); }, delay));
   }
 
   async run(tab: DocTab): Promise<ProofIssue[]> {
-    if (this.running) { this.schedule(tab, 800); return []; }
+    if (this.closed(tab)) { this.forget(tab); return []; }
+    if (this.running) { this.queued.add(tab); return []; }
     this.running = true;
     try {
       const doc = tab.view.state.doc;
@@ -286,6 +301,9 @@ export class Proofer {
       return issues;
     } finally {
       this.running = false;
+      const next = [...this.queued];
+      this.queued.clear();
+      for (const t of next) this.schedule(t, 50);
     }
   }
 }

@@ -9,7 +9,7 @@
  * named styles, links; note links (type="note" or pointing into the notes body) → footnotes.
  * Not mapped: document-info/publish-info (kept only where they map to properties), custom-info.
  */
-import JSZip from 'jszip';
+import { loadZip } from './zip';
 import type { Mark, Node as PMNode } from 'prosemirror-model';
 import { schema } from '../editor/schema';
 import { attr, kid, kids, kidsNamed, decodeXml, parseXml, textOf } from './xml-read';
@@ -197,7 +197,7 @@ export async function importFb2(data: ArrayBuffer, name: string): Promise<PMNode
   void name;
   const u8 = new Uint8Array(data);
   if (u8[0] === 0x50 && u8[1] === 0x4b) {
-    const zip = await JSZip.loadAsync(data);
+    const zip = await loadZip(data);
     const entry = Object.values(zip.files).find((f) => !f.dir && /\.fb2$/i.test(f.name)) || Object.values(zip.files).find((f) => !f.dir);
     if (!entry) throw new Error('The archive contains no .fb2 file');
     return fb2ToDoc(decodeXml(await entry.async('uint8array')));

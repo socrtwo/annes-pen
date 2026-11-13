@@ -60,13 +60,128 @@ function preClean(html: string): string {
     .replace(/<\/?(?:v|w|m|st1|st2|x|dt|wp|a14):[^>]*>/gi, '');
 }
 
+/** Block containers counted for the nesting cap. */
+const NEST_TAGS = new Set(['OL', 'UL', 'LI', 'DL', 'DD', 'DT', 'TABLE', 'TBODY', 'THEAD', 'TFOOT', 'TR', 'TD', 'TH', 'PRE', 'BLOCKQUOTE', 'DIV', 'SECTION', 'ARTICLE', 'ASIDE', 'NAV', 'HEADER', 'FOOTER', 'MAIN', 'FIGURE', 'DETAILS', 'FIELDSET', 'CENTER', 'FORM']);
+const MAX_NEST = 100;
+/** Any element nesting (inline markup too) beyond this is flattened as well. */
+const MAX_ELEMENT_DEPTH = 400;
+const LINE_TAGS = /^(P|DIV|LI|DT|DD|TR|TD|TH|PRE|BLOCKQUOTE|H[1-6]|BR|HR|TABLE|OL|UL|DL|SECTION|ARTICLE)$/;
+
+/**
+ * Content nested deeper than real documents go (MAX_NEST block containers, or MAX_ELEMENT_DEPTH
+ * elements) becomes plain paragraphs: the clean-up and the schema parser are super-linear on it.
+ */
+export function capNesting(root: Element): void {
+  const doc = root.ownerDocument;
+  const deep: Element[] = [];
+  const stack: [Element, number, number][] = [[root, 0, 0]];
+  while (stack.length) {
+    const [el, nest, depth] = stack.pop()!;
+    for (let c = el.firstElementChild; c; c = c.nextElementSibling) {
+      const n = nest + (NEST_TAGS.has(c.tagName) ? 1 : 0);
+      if (n > MAX_NEST || depth + 1 > MAX_ELEMENT_DEPTH) deep.push(c);
+      else stack.push([c, n, depth + 1]);
+    }
+  }
+  for (const el of deep) {
+    // Text by lines: block boundaries and line breaks (and newlines inside <pre>) end a paragraph.
+    const lines: string[] = [];
+    let cur = '';
+    const inPre = el.closest('pre') != null;
+    const walk: ([Node, boolean] | null)[] = [[el, inPre]];
+    while (walk.length) {
+      const w = walk.pop();
+      if (w === null) { lines.push(cur); cur = ''; continue; }
+      const [n, pre] = w!;
+      if (n.nodeType === 3) {
+        const t = n.nodeValue || '';
+        if (pre && t.includes('\n')) { const parts = t.split('\n'); cur += parts[0]; for (const q of parts.slice(1)) { lines.push(cur); cur = q; } }
+        else cur += pre ? t : t.replace(/\s+/g, ' ');
+        continue;
+      }
+      if (n.nodeType !== 1) continue;
+      const tag = (n as Element).tagName;
+      const block = LINE_TAGS.test(tag);
+      if (block) walk.push(null);
+      const kidPre = pre || tag === 'PRE';
+      for (let k = n.childNodes.length - 1; k >= 0; k--) walk.push([n.childNodes[k], kidPre]);
+      if (block && cur) { lines.push(cur); cur = ''; }
+    }
+    lines.push(cur);
+    const frag = doc.createDocumentFragment();
+    for (const l of lines) {
+      if (!l.trim()) continue;
+      const p = doc.createElement('p');
+      p.textContent = l;
+      frag.appendChild(p);
+    }
+    el.replaceWith(frag);
+  }
+}
+
+const INLINE_TAGS = new Set(['A', 'ABBR', 'B', 'BDI', 'BDO', 'BIG', 'CITE', 'CODE', 'DEL', 'DFN', 'EM', 'FONT', 'I', 'INS', 'KBD', 'MARK', 'Q', 'S', 'SAMP', 'SMALL', 'SPAN', 'STRIKE', 'STRONG', 'SUB', 'SUP', 'TT', 'U', 'VAR']);
+const MAX_INLINE = 200;
+/** Lower caps where deeper nesting means nothing in the document model (quotes and code are flattened). */
+const TAG_NEST: Record<string, number> = { BLOCKQUOTE: 4, PRE: 2 };
+const LINE_BREAK_TAGS = new Set(['LI', 'DT', 'DD', 'PRE', 'BLOCKQUOTE', 'DIV']);
+
+/**
+ * The same cap on the markup before parsing (HTML parsers are quadratic in nesting depth too):
+ * container tags past MAX_NEST open levels are dropped with their end tags, leaving their text
+ * (in a new paragraph where the tag started a block).
+ * Implied ends (a new <li> ends the open one, and so on) are followed so long flat lists stay intact.
+ */
+export function capNestingSource(html: string): string {
+  const stack: string[] = [];
+  const dropped = new Map<string, number>();
+  const implied: Record<string, string[]> = { LI: ['LI'], DT: ['DT', 'DD'], DD: ['DT', 'DD'], TD: ['TD', 'TH'], TH: ['TD', 'TH'], TR: ['TD', 'TH', 'TR'] };
+  let changed = false;
+  const inline: string[] = [];
+  const out = html.replace(/<(\/?)([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>/g, (m, close: string, name: string) => {
+    const tag = name.toUpperCase();
+    if (INLINE_TAGS.has(tag)) {
+      // Formatting tags are normally closed explicitly; past MAX_INLINE open ones they are dropped.
+      if (!close) {
+        if (inline.length >= MAX_INLINE) { dropped.set(tag, (dropped.get(tag) || 0) + 1); changed = true; return ''; }
+        inline.push(tag);
+        return m;
+      }
+      const d = dropped.get(tag) || 0;
+      if (d > 0) { dropped.set(tag, d - 1); return ''; }
+      const at = inline.lastIndexOf(tag);
+      if (at >= 0) inline.length = at;
+      return m;
+    }
+    if (!NEST_TAGS.has(tag)) return m;
+    if (!close) {
+      const ends = implied[tag];
+      if (ends) while (stack.length && ends.includes(stack[stack.length - 1])) stack.pop();
+      if (stack.length >= MAX_NEST || (TAG_NEST[tag] != null && stack.filter((t) => t === tag).length >= TAG_NEST[tag])) {
+        dropped.set(tag, (dropped.get(tag) || 0) + 1);
+        changed = true;
+        return LINE_BREAK_TAGS.has(tag) ? '<p>' : '';
+      }
+      stack.push(tag);
+      return m;
+    }
+    const d = dropped.get(tag) || 0;
+    if (d > 0) { dropped.set(tag, d - 1); return ''; }
+    const at = stack.lastIndexOf(tag);
+    if (at >= 0) stack.length = at;
+    return m;
+  });
+  return changed ? out : html;
+}
+
 const REMOVE_SELECTOR = 'script:not([type^="math/tex"]), style, meta, link, title, noscript, template, iframe, object, embed, xml, head, canvas, video, audio, select, textarea, map, area, svg title';
 
 function unwrap(el: Element): void {
   const parent = el.parentNode;
   if (!parent) return;
-  while (el.firstChild) parent.insertBefore(el.firstChild, el);
-  parent.removeChild(el);
+  // One insertion of all children (moving them one by one is quadratic in some DOMs).
+  const frag = el.ownerDocument.createDocumentFragment();
+  while (el.firstChild) frag.appendChild(el.firstChild);
+  parent.replaceChild(frag, el);
 }
 
 function rename(el: Element, tag: string): Element {
@@ -289,6 +404,16 @@ export interface CleanOptions {
 export function cleanHtmlDom(root: HTMLElement, opts: CleanOptions = {}): void {
   const doc = root.ownerDocument;
   stripActiveContent(root);
+  // Whitespace that the page keeps (white-space:pre*, and our own export, whose style sheet sets
+  // pre-wrap on text) is kept on import: tabs, space runs, leading spaces.
+  const keepWs = new Set<Element>();
+  root.querySelectorAll('[style*="white-space"]').forEach((el) => { if (/white-space\s*:\s*(pre|break-spaces)/i.test(el.getAttribute('style') || '')) keepWs.add(el); });
+  root.querySelectorAll('.qf-doc p, .qf-doc h1, .qf-doc h2, .qf-doc h3, .qf-doc h4, .qf-doc h5, .qf-doc h6').forEach((el) => keepWs.add(el));
+  // A line break that ends a block adds no line (browsers ignore it): our export writes one in empty paragraphs.
+  root.querySelectorAll('p, h1, h2, h3, h4, h5, h6, li, td, th').forEach((el) => {
+    const last = el.lastChild;
+    if (last && last.nodeType === 1 && (last as Element).tagName === 'BR' && !(last as Element).getAttribute('style') && !(last as Element).getAttribute('class')) last.remove();
+  });
   const raw = root.innerHTML;
   const isWord = /mso-|class="?Mso|urn:schemas-microsoft-com/i.test(raw);
   // <ol start=""> (or any non-number) would give the list a NaN start.
@@ -463,7 +588,10 @@ export function cleanHtmlDom(root: HTMLElement, opts: CleanOptions = {}): void {
   root.querySelectorAll('a[name]:not([href]):not(.qf-bookmark)').forEach(unwrap);
 
   // Task lists.
+  const anyBox = !!root.querySelector('input[type="checkbox"]');
   root.querySelectorAll('ul, ol').forEach((list) => {
+    // Without any checkbox only the class or data-type can make a task list (and the per-item search is skipped).
+    if (!anyBox && !(list.getAttribute('data-type') === 'task' || list.classList.contains('task-list') || list.classList.contains('contains-task-list'))) return;
     const items = Array.from(list.children).filter((c) => c.tagName === 'LI');
     if (!items.length) return;
     const boxOf = (li: Element): HTMLInputElement | null => {
@@ -518,9 +646,11 @@ export function cleanHtmlDom(root: HTMLElement, opts: CleanOptions = {}): void {
   // Blockquotes holding blocks: style the paragraphs as quotes and unwrap.
   const quotes = Array.from(root.querySelectorAll('blockquote')).reverse();
   for (const q of quotes) {
-    const hasBlocks = Array.from(q.children).some((c) => /^(P|DIV|H[1-6]|UL|OL|TABLE|PRE|BLOCKQUOTE|FIGURE|HR)$/.test(c.tagName));
+    // Sibling walks rather than .children/.childNodes: those are live lists that every later move must update.
+    let hasBlocks = false;
+    for (let c = q.firstElementChild; c && !hasBlocks; c = c.nextElementSibling) hasBlocks = /^(P|DIV|H[1-6]|UL|OL|TABLE|PRE|BLOCKQUOTE|FIGURE|HR)$/.test(c.tagName);
     if (!hasBlocks) continue;
-    for (const c of Array.from(q.childNodes)) {
+    for (let c = q.firstChild, next = c?.nextSibling ?? null; c; c = next, next = c?.nextSibling ?? null) {
       if (c.nodeType === 3 && (c.textContent || '').trim()) {
         const p = doc.createElement('p');
         p.setAttribute('data-style', 'Quote');
@@ -567,6 +697,22 @@ export function cleanHtmlDom(root: HTMLElement, opts: CleanOptions = {}): void {
     p.setAttribute('data-style', 'Caption');
   });
 
+  // Spans past the table's grid (colspan="99999") would make the table that big: clamp them to it.
+  root.querySelectorAll('table').forEach((tbl) => {
+    const rows = Array.from((tbl as HTMLTableElement).rows || []);
+    let width = 0;
+    tbl.querySelectorAll(':scope > col, :scope > colgroup > col').forEach(() => { width++; });
+    for (const r of rows) width = Math.max(width, r.cells.length);
+    rows.forEach((r, ri) => {
+      for (const c of Array.from(r.cells)) {
+        const cs = parseInt(c.getAttribute('colspan') || '1', 10);
+        if (cs > width) c.setAttribute('colspan', String(Math.max(1, width)));
+        const rs = parseInt(c.getAttribute('rowspan') || '1', 10);
+        if (rs > rows.length - ri) c.setAttribute('rowspan', String(Math.max(1, rows.length - ri)));
+      }
+    });
+  });
+
   // Table widths → colwidth (pixels) for prosemirror-tables.
   root.querySelectorAll('td, th').forEach((td) => {
     if (td.hasAttribute('data-colwidth')) return;
@@ -582,6 +728,7 @@ export function cleanHtmlDom(root: HTMLElement, opts: CleanOptions = {}): void {
 
   // Style attributes.
   root.querySelectorAll('[style]').forEach((e) => cleanStyleAttr(e as HTMLElement));
+  for (const el of keepWs) if (el.isConnected && el.tagName !== 'PRE') el.setAttribute('style', [el.getAttribute('style'), 'white-space:pre-wrap'].filter(Boolean).join(';'));
   // Word wraps everything in <div class=WordSection1>.
   root.querySelectorAll('div[class^="WordSection"], div[class^="Section"]').forEach(unwrap);
   // Empty spans.
@@ -591,7 +738,7 @@ export function cleanHtmlDom(root: HTMLElement, opts: CleanOptions = {}): void {
 /** Clean HTML coming from the clipboard (Word, Google Docs, web pages) and return HTML for pasting. */
 export function cleanPastedHtml(html: string): string {
   try {
-    const d = new DOMParser().parseFromString(preClean(html), 'text/html');
+    const d = parseHtmlDocument(html);
     cleanHtmlDom(d.body);
     return d.body.innerHTML;
   } catch {
@@ -603,7 +750,9 @@ export function cleanPastedHtml(html: string): string {
 
 /** Parse an HTML string into an HTML Document, applying the string-level clean-up. */
 export function parseHtmlDocument(html: string): Document {
-  return new DOMParser().parseFromString(preClean(html), 'text/html');
+  const d = new DOMParser().parseFromString(capNestingSource(preClean(html)), 'text/html');
+  if (d.body) capNesting(d.body);
+  return d;
 }
 
 /** Convert an (already cleaned) element's children into schema blocks. */

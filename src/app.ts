@@ -2,7 +2,7 @@
 import { isSafeExternalUrl } from './util/sanitize';
 import { normalizeTables } from './editor/normalize';
 import { EditorState, TextSelection, type Transaction } from 'prosemirror-state';
-import { DocAttrStep } from 'prosemirror-transform';
+import { DocAttrStep, Mapping } from 'prosemirror-transform';
 import { EditorView } from 'prosemirror-view';
 import type { Node as PMNode } from 'prosemirror-model';
 import { schema, emptyDoc } from './editor/schema';
@@ -16,12 +16,50 @@ import { stylesCss } from './editor/styles';
 import { expandTokens, computeFields, applyFieldValues } from './editor/fields';
 import { getCommand, allCommands, type Command } from './commands/registry';
 import { loadPrefs, savePrefs, type Prefs } from './prefs';
-import { kvSet, kvDel } from './util/store';
+import { kvSet, kvDel, kvLastError, SESSION_ID, sessionBeat } from './util/store';
 import { toast } from './ui/dialog';
 import { esc } from './ui/dom';
 import type { Shell } from './ui/shell';
 import { Proofer } from './proof/proofing';
 import { embedHidden } from './embed/hidden';
+
+export interface PositionTracker {
+  tab: DocTab;
+  map(pos: number, assoc?: number): number;
+  deleted(pos: number, assoc?: number): boolean;
+  /** The document was replaced (Revert, reload) or closed: old positions mean nothing. */
+  readonly lost: boolean;
+  readonly changed: boolean;
+  done(): void;
+}
+
+/** App.trackPositions, or (for minimal stand-ins of App) a tracker that only notices a changed document. */
+export function trackPositions(app: App): PositionTracker {
+  if (typeof (app as any).trackPositions === 'function') return app.trackPositions();
+  const doc0 = app.state.doc;
+  return { tab: app.tab, map: (p) => p, deleted: () => false, get lost() { return app.state.doc !== doc0; }, get changed() { return app.state.doc !== doc0; }, done() {} };
+}
+
+/** A node to find again after waiting on the user (a dialog): where it was, or else where that same node
+ *  object is now (nodes the edits did not touch stay the same objects). */
+export interface PinnedNode { pos: number; node: PMNode | null }
+export function pinNode(doc: PMNode, pos: number): PinnedNode {
+  return { pos, node: pos >= 0 && pos < doc.content.size ? doc.nodeAt(pos) : null };
+}
+/** The pinned node's position in `doc`, or -1 if it is gone or was changed. */
+export function findPinned(doc: PMNode, pin: PinnedNode): number {
+  if (!pin.node) return -1;
+  if (pin.pos < doc.content.size && doc.nodeAt(pin.pos) === pin.node) return pin.pos;
+  let at = -1;
+  doc.descendants((n, p) => { if (at < 0 && n === pin.node) at = p; return at < 0; });
+  return at;
+}
+
+/** The link under a click inside a document. */
+function linkTarget(view: EditorView, e: Event): HTMLAnchorElement | null {
+  const a = (e.target as HTMLElement | null)?.closest?.('a[href]') as HTMLAnchorElement | null;
+  return a && view.dom.contains(a) ? a : null;
+}
 
 export type ViewMode = 'print' | 'web' | 'mobile' | 'read' | 'outline' | 'draft' | 'focus';
 
@@ -54,6 +92,13 @@ export class DocTab {
   recovery: import('./io/recover').RecoveryReport | null = null;
   /** Storage key for documents without a unique URI (see docKey in commands/file). */
   key = '';
+  /** Opened from (or saved as) an encrypted .qpde file: the key derived from its password, kept in memory only.
+   *  Save re-encrypts with it; drafts are stored encrypted and snapshots are not taken. */
+  encryption: import('./util/crypto').DocKey | null = null;
+  /** Recent edit locations in this document (Go Back). */
+  editPositions: number[] = [];
+  /** Position trackers of commands waiting on a dialog (see App.trackPositions). */
+  posTrackers = new Set<{ mapping: Mapping; lost: boolean }>();
   constructor(public app: App) {}
 
   get state(): EditorState { return this.view.state; }
@@ -76,7 +121,8 @@ export class App {
   private listeners = new Set<(app: App) => void>();
   lastCommand: { id: string; arg?: any } | null = null;
   keyIndex = new Map<string, string>();
-  editPositions: number[] = [];
+  /** The active document's recent edit locations. */
+  get editPositions(): number[] { return this.active?.editPositions ?? []; }
   proofer: Proofer;
   /** Embedded editor for Anne's Post (?embed=compose): no file commands, drafts or autosave (docs/EMBED.md). */
   embedded = false;
@@ -171,6 +217,10 @@ export class App {
         contextmenu: (view, e) => { e.preventDefault(); this.ui.contextMenu(e as MouseEvent); return true; },
         copy: (view, e) => { this.rememberClipboard(); return false; },
         cut: (view, e) => { this.rememberClipboard(); return false; },
+        // The click after the mouseup handled in handleClickOn would still follow the link and navigate
+        // the app itself (relative links included): links are only ever opened by followLink.
+        click: (view, e) => { if (linkTarget(view, e)) e.preventDefault(); return false; },
+        auxclick: (view, e) => { if (linkTarget(view, e)) e.preventDefault(); return false; },
       },
       handleTextInput: (view, from, to, text) => {
         if (this.recording) this.recordStep('edit.typeText', text);
@@ -240,6 +290,8 @@ export class App {
   closeTab(tab: DocTab): void {
     const i = this.docs.indexOf(tab);
     if (i < 0) return;
+    for (const t of tab.posTrackers) t.lost = true;
+    this.proofer.forget(tab);
     tab.view.destroy();
     tab.el.remove();
     this.docs.splice(i, 1);
@@ -250,6 +302,7 @@ export class App {
 
   replaceDoc(tab: DocTab, doc: PMNode): void {
     const state = EditorState.create({ doc: normalizeTables(doc), plugins: tab.view.state.plugins });
+    for (const t of tab.posTrackers) t.lost = true;
     tab.view.updateState(state);
     this.applySettingsToDom(tab);
     this.updateFields(tab);
@@ -263,6 +316,9 @@ export class App {
   dispatch(tab: DocTab, tr: Transaction): void {
     const view = tab.view;
     const old = view.state;
+    // A transaction built before the document last changed (typically before an awaited dialog) cannot be
+    // applied: refuse it with a message instead of a RangeError.
+    if (tr.before !== old.doc) { toast('The document changed while this command was waiting. Try it again.'); return; }
     // Protection applies to every content change (trackSkip only means "do not track this"), except
     // explicitly allowed ones (field updates, Restrict Editing) and settings-only changes that leave
     // the protection itself alone.
@@ -277,10 +333,13 @@ export class App {
     const next = old.apply(t);
     view.updateState(next);
     if (t.docChanged) {
+      for (const pt of tab.posTrackers) pt.mapping.appendMapping(t.mapping);
       const head = next.selection.head;
-      const lastPos = this.editPositions[this.editPositions.length - 1];
-      if (lastPos == null || Math.abs(t.mapping.map(lastPos) - head) > 200) { this.editPositions.push(head); if (this.editPositions.length > 20) this.editPositions.shift(); }
-      else this.editPositions[this.editPositions.length - 1] = head;
+      const ep = tab.editPositions;
+      for (let i = 0; i < ep.length; i++) ep[i] = t.mapping.map(ep[i]);
+      const lastPos = ep[ep.length - 1];
+      if (lastPos == null || Math.abs(lastPos - head) > 200) { ep.push(head); if (ep.length > 20) ep.shift(); }
+      else ep[ep.length - 1] = head;
       // noDirty: derived updates (field values refreshed on open) are not user edits.
       if (!tr.getMeta('noDirty')) {
         if (!tab.dirty) { tab.dirty = true; this.ui.tabsChanged(); document.title = `${tab.displayName} • – Anne\'s Pen`; }
@@ -292,6 +351,23 @@ export class App {
     if (old.doc.attrs.settings !== next.doc.attrs.settings) this.applySettingsToDom(tab);
     if (t.docChanged || t.selectionSet || t.storedMarksSet || t.getMeta('refresh') || t.getMeta(proofKey)) this.refresh();
     if (this.prefs.typewriter && (t.docChanged || t.selectionSet)) this.typewriterScroll(tab);
+  }
+
+  /**
+   * Maps positions in a tab's current document through every change made to it until done() is called.
+   * Commands that wait on a dialog use it to apply positions they found before the wait.
+   */
+  trackPositions(tab = this.active): PositionTracker {
+    const t = { mapping: new Mapping(), lost: false };
+    tab.posTrackers.add(t);
+    return {
+      tab,
+      map: (pos, assoc = 1) => t.mapping.map(pos, assoc),
+      deleted: (pos, assoc = 1) => t.mapping.mapResult(pos, assoc).deleted,
+      get lost() { return t.lost; },
+      get changed() { return t.lost || t.mapping.maps.length > 0; },
+      done: () => { tab.posTrackers.delete(t); },
+    };
   }
 
   /** A transaction that only changes document settings without touching protection. */
@@ -527,13 +603,21 @@ export class App {
   async saveDrafts(): Promise<void> {
     // The embedding app owns an embedded message: nothing of it is stored here.
     if (this.embedded) return;
+    sessionBeat();
+    let saved = 0, failed = 0;
     for (const tab of this.docs) {
       if (!tab.dirty) continue;
-      await kvSet('draft:' + tab.id, {
-        id: tab.id, json: tab.view.state.doc.toJSON(), title: tab.title, fileName: tab.fileName, format: tab.format, uri: tab.uri, key: tab.key, time: Date.now(),
+      // An encrypted document's draft is encrypted with its key (the plain text is never stored).
+      const body = tab.encryption
+        ? { enc: await (await import('./util/crypto')).encryptWithKey(tab.view.state.doc.toJSON(), tab.encryption) }
+        : { json: tab.view.state.doc.toJSON() };
+      const ok = await kvSet('draft:' + tab.id, {
+        id: tab.id, ...body, title: tab.title, fileName: tab.fileName, format: tab.format, uri: tab.uri, key: tab.key, time: Date.now(), owner: SESSION_ID,
       });
+      if (ok === false) failed++; else saved++;
     }
-    this.ui.status?.('Draft saved');
+    if (failed) this.ui.status?.(kvLastError() === 'QuotaExceededError' ? 'Draft could not be saved: storage full' : 'Draft could not be saved');
+    else if (saved) this.ui.status?.('Draft saved');
   }
 
   followLink(href: string): void {

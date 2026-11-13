@@ -573,7 +573,16 @@ class TexReader {
     buf.text(out, marks);
   }
 
+  private inlineDepth = 0;
+
   private inlineInto(s: string, marks: readonly Mark[], buf: InlineBuf): void {
+    // Pathologically deep groups are flattened to their text rather than recursed into.
+    if (this.inlineDepth >= 200) { this.text(buf, s.replace(/\\[a-zA-Z]+\*?|[{}\\]/g, ''), marks); return; }
+    this.inlineDepth++;
+    try { this.inlineBody(s, marks, buf); } finally { this.inlineDepth--; }
+  }
+
+  private inlineBody(s: string, marks: readonly Mark[], buf: InlineBuf): void {
     let m = marks;
     let plain = '';
     const flushText = () => { this.text(buf, plain, m); plain = ''; };

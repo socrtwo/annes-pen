@@ -23,6 +23,8 @@ export function snappyDecompress(src: Uint8Array): Uint8Array {
     if (shift > 28) throw new Error('snappy: bad length');
   }
   if (len > 256 * 1024 * 1024) throw new Error('snappy: too large');
+  // Each tag expands to at most 64 bytes, so a length beyond that ratio can't be honest.
+  if (len > (src.length - i) * 64) throw new Error('snappy: bad length');
   const out = new Uint8Array(len);
   let o = 0;
   while (i < src.length) {

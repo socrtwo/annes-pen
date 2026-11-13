@@ -13,7 +13,7 @@ A recovered document opens as "*name* (Recovered)". **Save** asks for a new name
 
 | Step | Method | From Word Recovery? |
 |---|---|---|
-| 0 | **S2 File Identifier:** magic-number identification; finds and separates embedded or concatenated files (for example a PDF fused onto a DOCX); recommends the right S2 tool for each foreign piece | Yes (`s2-file-id.js`) |
+| 0 | **S2 File Identifier:** magic-number identification; finds and separates embedded or concatenated files (for example a PDF fused onto a DOCX); recommends the right S2 tool for each foreign piece | Yes: a port of Word Recovery's `s2-file-id.js` (in the upstream project), here `src/io/recover/fileid.ts` |
 | 1 | **Standard parse:** open the package and verify each part's CRC-32 (damaged deflate data often decompresses without an error) | Yes, plus CRC checks |
 | 2 | **Byte-level ZIP recovery:** walk `PK\x03\x04` local headers and ignore the central directory; inflate each entry with **ImmortalInflate**, a decoder that never throws, at bit shifts 0–47 | Yes, plus declared-size use, CRC checks and deflate-block resync |
 | 3 | **XML repair:** the original InvalidTags → ValidTags substitutions for `word/document.xml`, then `healXMLStrict`, then a new tag-soup rebuilder (mis-nested and truncated elements, stray `&`, duplicate attributes, undeclared prefixes) | Yes, plus the rebuilder |

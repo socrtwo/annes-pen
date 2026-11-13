@@ -13,6 +13,7 @@
  * header/footer text, and document metadata. Both formats share the same code paths.
  */
 import JSZip from 'jszip';
+import { loadZip } from './zip';
 import { Mark, type Node as PMNode } from 'prosemirror-model';
 import { TableMap } from 'prosemirror-tables';
 import { styleLevel } from '../editor/schema';
@@ -52,6 +53,12 @@ const MIME = 'application/vnd.oasis.opendocument.text';
 // Export
 
 const pt = (n: number | null | undefined) => `${r2(n || 0)}pt`;
+
+/** An ODF dateTime in UTC, with its Z: without a zone readers take the time as local. */
+function odfDate(v: unknown): string {
+  const d = v == null || v === '' ? new Date() : new Date(v as number | string);
+  return (Number.isFinite(d.getTime()) ? d : new Date()).toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
 const x = escapeXml;
 
 /** Encode a style name as an ODF NCName (LibreOffice style: spaces → _20_). */
@@ -118,6 +125,12 @@ class OdtWriter {
   listId = 0;
   sectId = 0;
   annId = 0;
+  /** Comments open across paragraphs: id -> annotation names (the comment, then its replies). */
+  openComments = new Map<string, string[]>();
+  /** Lists being written, outermost first, with the element the current item was opened as. */
+  listLevels: { tag: string; style: string | null }[] = [];
+  /** The last textblock each comment covers, where its annotation-end goes. */
+  commentEnds = new Map<string, PMNode>();
   contentWidth: number;
   author: string;
   title: string;
@@ -136,6 +149,17 @@ class OdtWriter {
     this.fileName = opts.fileName || '';
     this.fonts.add(resolveFontName('+body', this.settings) || 'Carlito');
     this.fonts.add(resolveFontName('+heading', this.settings) || 'Carlito');
+    doc.descendants((n) => {
+      if (!n.isTextblock) return true;
+      n.forEach((c) => { for (const m of c.marks) if (m.type.name === 'comment') this.commentEnds.set(m.attrs.id, n); });
+      return false;
+    });
+  }
+
+  private closeComment(id: string): string {
+    const names = this.openComments.get(id) || [];
+    this.openComments.delete(id);
+    return names.map((n) => `<office:annotation-end office:name="${n}"/>`).join('');
   }
 
   eff(name: string): StyleDef { return effectiveStyle(this.styles, this.styles[name] ? name : 'Normal'); }
@@ -407,7 +431,8 @@ class OdtWriter {
 
   changeRegion(kind: 'insertion' | 'deletion', m: Mark, deleted?: string): string {
     const id = `ct${++this.changeId}`;
-    const date = m.attrs.date ? new Date(m.attrs.date).toISOString().replace(/\.\d{3}Z$/, '') : isoNow().replace(/Z$/, '');
+    // UTC with its Z (xsd:dateTime): without a zone readers take the time as local.
+    const date = odfDate(m.attrs.date);
     const info = `<office:change-info><dc:creator>${x(m.attrs.author || 'Unknown')}</dc:creator><dc:date>${date}</dc:date></office:change-info>`;
     const body = kind === 'deletion' ? `<text:deletion>${info}<text:p>${this.text(deleted || '', { v: true })}</text:p></text:deletion>` : `<text:insertion>${info}</text:insertion>`;
     this.changes.push(`<text:changed-region text:id="${id}">${body}</text:changed-region>`);
@@ -419,7 +444,7 @@ class OdtWriter {
     const kids: PMNode[] = [];
     node.forEach((c) => kids.push(c));
     const atStart = { v: true };
-    const openComments = new Map<string, string>();
+    const openComments = this.openComments;
     let openIns: { mark: Mark; id: string } | null = null;
     const comments = this.settings.comments || {};
     let i = 0;
@@ -428,15 +453,22 @@ class OdtWriter {
       const k = kids[i];
       // Comments
       const cms = k.marks.filter((m) => m.type.name === 'comment');
-      for (const [cid, name] of [...openComments]) if (!cms.some((m) => m.attrs.id === cid)) { out += `<office:annotation-end office:name="${name}"/>`; openComments.delete(cid); }
+      for (const cid of [...openComments.keys()]) if (!cms.some((m) => m.attrs.id === cid)) out += this.closeComment(cid);
       for (const m of cms) {
         if (openComments.has(m.attrs.id)) continue;
         const name = `__Annotation__${++this.annId}`;
-        openComments.set(m.attrs.id, name);
         const c = comments[m.attrs.id];
-        const date = c?.date ? new Date(c.date).toISOString().replace(/\.\d{3}Z$/, '') : isoNow().replace(/Z$/, '');
-        const paras = [c?.text || '', ...(c?.replies || []).map((r) => `${r.author}: ${r.text}`)].map((t) => `<text:p>${this.text(t, { v: true })}</text:p>`).join('');
-        out += `<office:annotation office:name="${name}"><dc:creator>${x(c?.author || this.author || 'Unknown')}</dc:creator><dc:date>${date}</dc:date>${paras}</office:annotation>`;
+        // Replies are annotations of their own over the same range (as LibreOffice writes them).
+        const resolved = c?.resolved ? ' loext:resolved="true"' : '';
+        const body = (t: string) => t.split('\n').map((l) => `<text:p>${this.text(l, { v: true })}</text:p>`).join('');
+        out += `<office:annotation office:name="${name}"${resolved}><dc:creator>${x(c?.author || this.author || 'Unknown')}</dc:creator><dc:date>${odfDate(c?.date)}</dc:date>${body(c?.text || '')}</office:annotation>`;
+        const names = [name];
+        for (const r of c?.replies || []) {
+          const rn = `${name}_r${names.length}`;
+          names.push(rn);
+          out += `<office:annotation office:name="${rn}" loext:parent-name="${name}"${resolved}><dc:creator>${x(r.author || 'Unknown')}</dc:creator><dc:date>${odfDate(r.date)}</dc:date>${body(r.text || '')}</office:annotation>`;
+        }
+        openComments.set(m.attrs.id, names);
       }
       // Deletions (tracked)
       const del = k.marks.find((m) => m.type.name === 'deletion');
@@ -473,7 +505,8 @@ class OdtWriter {
       i++;
     }
     closeIns();
-    for (const [, name] of openComments) out += `<office:annotation-end office:name="${name}"/>`;
+    // A comment that goes on in a later paragraph stays open.
+    for (const cid of [...openComments.keys()]) if (this.commentEnds.get(cid) === node || !this.commentEnds.has(cid)) out += this.closeComment(cid);
     return out;
   }
 
@@ -532,9 +565,12 @@ class OdtWriter {
     const ls = top ? this.listStyle(node) : null;
     const items: string[] = [];
     let first = true;
+    const level = { tag: 'text:list-item', style: ls?.name ?? null };
+    this.listLevels.push(level);
     node.forEach((item) => {
       let body = '';
       let firstPara = true;
+      level.tag = 'text:list-item';
       const checked = node.type === S.nodes.task_list ? !!item.attrs.checked : item.attrs.checked;
       item.forEach((b) => {
         if (b.type === S.nodes.paragraph && firstPara) {
@@ -544,14 +580,34 @@ class OdtWriter {
         }
         firstPara = false;
         if (b.type === S.nodes.bullet_list || b.type === S.nodes.ordered_list || b.type === S.nodes.task_list) body += this.list(b, false);
+        else if (b.type === S.nodes.table || b.type === S.nodes.column_section) body += this.outsideList(b);
         else body += this.block(b, null);
       });
       const order = Math.max(1, listStart(node.attrs.order)); // text:start-value is a positive integer
       const start = first && node.type === S.nodes.ordered_list && order !== 1 ? ` text:start-value="${order}"` : '';
       first = false;
-      items.push(`<text:list-item${start}>${body}</text:list-item>`);
+      items.push(`<text:list-item${start}>${body}</${level.tag}>`);
     });
+    this.listLevels.pop();
     return `<text:list${ls ? ` text:style-name="${ls.name}"` : ''}>${items.join('')}</text:list>`;
+  }
+
+  /**
+   * A list item may hold only paragraphs, headings and lists: a table (or section) closes the open
+   * lists, follows them, and the lists go on (numbering continued) with an unnumbered header item.
+   */
+  outsideList(b: PMNode): string {
+    const levels = this.listLevels;
+    let out = '';
+    for (let i = levels.length - 1; i >= 0; i--) out += `</${levels[i].tag}></text:list>`;
+    this.listLevels = [];
+    out += this.block(b, null);
+    this.listLevels = levels;
+    for (const l of levels) {
+      out += `<text:list${l.style ? ` text:style-name="${l.style}"` : ''} text:continue-numbering="true"><text:list-header>`;
+      l.tag = 'text:list-header';
+    }
+    return out;
   }
 
   table(node: PMNode): string {
@@ -795,7 +851,7 @@ class OdtWriter {
 
   metaInner(): string {
     const p = this.settings.properties;
-    const now = isoNow().replace(/Z$/, '');
+    const now = isoNow();
     const items = [
       '<meta:generator>Anne\'s Pen</meta:generator>',
       this.title ? `<dc:title>${x(this.title)}</dc:title>` : '',
@@ -930,6 +986,9 @@ class OdtReader {
   activeComments: Mark[] = [];
   pendingPointComment: Mark | null = null;
   commentNames = new Map<string, string>();
+  /** Reply annotation name -> the name of the comment it belongs to. */
+  replyRoot = new Map<string, string>();
+  pendingReplies = new Map<string, { author: string; date: number; text: string; resolved: boolean }[]>();
   commentSeq = 0;
   deferred: PMNode[] = [];
   breakAfter = false;
@@ -1247,11 +1306,25 @@ class OdtReader {
         }
         case 'office:annotation': {
           const name = att(c, 'office', 'name');
-          const id = `odt-c${++this.commentSeq}`;
           const author = find(c, 'dc:creator')?.textContent || '';
           const date = Date.parse(find(c, 'dc:date')?.textContent || '') || Date.now();
           const text = elKids(c).filter((k) => qn(k) === 'text:p' || qn(k) === 'text:h' || qn(k) === 'text:list').map((p) => this.plainText(p)).join('\n');
-          this.settings.comments = { ...this.settings.comments, [id]: { id, author, date, text, resolved: false, replies: [] } };
+          const resolved = att(c, 'loext', 'resolved') === 'true';
+          // A reply (LibreOffice): added to its parent comment, which marks the range. LibreOffice
+          // may write a reply before its parent; it then waits for the parent.
+          const parentName = att(c, 'loext', 'parent-name');
+          if (parentName) {
+            const reply = { author, date, text, resolved };
+            const root = this.replyRoot.get(parentName) ?? parentName;
+            if (name) this.replyRoot.set(name, root);
+            const parentId = this.commentNames.get(root);
+            if (parentId) this.addReply(parentId, reply);
+            else this.pendingReplies.set(root, [...(this.pendingReplies.get(root) || []), reply]);
+            break;
+          }
+          const id = `odt-c${++this.commentSeq}`;
+          this.settings.comments = { ...this.settings.comments, [id]: { id, author, date, text, resolved, replies: [] } };
+          for (const r of (name && this.pendingReplies.get(name)) || []) this.addReply(id, r);
           const mark = S.marks.comment.create({ id });
           if (name) { this.commentNames.set(name, id); this.activeComments.push(mark); } else this.pendingPointComment = mark;
           break;
@@ -1334,6 +1407,13 @@ class OdtReader {
     }
   }
 
+  addReply(parentId: string, r: { author: string; date: number; text: string; resolved: boolean }): void {
+    const parent = this.settings.comments[parentId];
+    if (!parent) return;
+    const reply = { id: `${parentId}-r${parent.replies.length + 1}`, author: r.author, date: r.date, text: r.text };
+    this.settings.comments = { ...this.settings.comments, [parentId]: { ...parent, resolved: parent.resolved || r.resolved, replies: [...parent.replies, reply] } };
+  }
+
   emitText(t: string, marks: Mark[], out: PMNode[]): void {
     if (!t) return;
     const m = this.activeComments.length || this.activeChanges.length ? markSet([...marks, ...this.activeComments, ...this.activeChanges]) : marks;
@@ -1391,10 +1471,11 @@ class OdtReader {
     const paraMarks = this.textMarks(dtp);
     const inl: PMNode[] = [];
     this.deferred = [];
-    this.inline(el, paraMarks, inl, { last: true });
-    // Trim the collapsed trailing space.
+    const ws = { last: true };
+    this.inline(el, paraMarks, inl, ws);
+    // Trim the collapsed trailing space (never one from <text:s>, which ends with ws.last false).
     const last = inl[inl.length - 1];
-    if (last && last.isText && / $/.test(last.text || '') && !/ {2}$/.test(last.text || '')) {
+    if (ws.last && last && last.isText && / $/.test(last.text || '')) {
       const t = (last.text || '').replace(/ $/, '');
       inl.pop();
       if (t) inl.push(S.text(t, last.marks));
@@ -1485,8 +1566,9 @@ class OdtReader {
         if (q !== 'table:table-cell') continue;
         let rep = Math.min(64, parseInt(att(c, 'table', 'number-columns-repeated') || '1', 10) || 1);
         if (col + rep > Math.max(maxCols, 64)) rep = Math.max(1, Math.max(maxCols, 64) - col);
-        const colspan = Math.max(1, parseInt(att(c, 'table', 'number-columns-spanned') || '1', 10) || 1);
-        const rowspan = Math.max(1, parseInt(att(c, 'table', 'number-rows-spanned') || '1', 10) || 1);
+        // Spans stay inside the table (huge values would build huge tables).
+        const colspan = Math.max(1, Math.min(parseInt(att(c, 'table', 'number-columns-spanned') || '1', 10) || 1, Math.max(maxCols, 64) - col));
+        const rowspan = Math.max(1, Math.min(parseInt(att(c, 'table', 'number-rows-spanned') || '1', 10) || 1, rows.length - ri));
         const st = this.style(att(c, 'table', 'style-name'), 'table-cell');
         const bg = st ? toHexColor(st.cell['fo:background-color']) : null;
         const va = st?.cell['style:vertical-align'];
@@ -1511,6 +1593,7 @@ class OdtReader {
   }
 
   blocks(container: Element, out: PMNode[], ctx: { listDepth: number; listStyle: string | null }): void {
+    joinListContinuations(container);
     const start = out.length;
     for (const el of elKids(container)) {
       const q = qn(el);
@@ -1752,6 +1835,53 @@ class OdtReader {
   }
 }
 
+const isItem = (e: Element | null | undefined) => !!e && (qn(e) === 'text:list-item' || qn(e) === 'text:list-header');
+const firstItem = (l: Element) => elKids(l).find(isItem);
+const lastItem = (l: Element) => elKids(l).filter(isItem).pop();
+
+/**
+ * Tables (or sections) cannot sit in a list item, so a list item holding one is written as: the
+ * lists closed, the table, and the lists continued with an unnumbered header item (see the writer's
+ * outsideList). Put such tables back into the item and the continued list back into the first one.
+ */
+function joinListContinuations(container: Element): void {
+  const kids = elKids(container);
+  for (let k = 0; k < kids.length; k++) {
+    const l2 = kids[k];
+    if (qn(l2) !== 'text:list' || !continues(l2)) continue;
+    let j = k - 1;
+    while (j >= 0 && (qn(kids[j]) === 'table:table' || qn(kids[j]) === 'text:section')) j--;
+    if (j < 0 || j === k - 1 || qn(kids[j]) !== 'text:list') continue;
+    const between = kids.slice(j + 1, k);
+    mergeList(kids[j], between, l2);
+    kids.splice(j + 1, k - j);
+    k = j;
+  }
+}
+
+/** A continuation list: continued numbering, starting with a header item. */
+function continues(l: Element): boolean {
+  const f = firstItem(l);
+  return !!f && qn(f) === 'text:list-header' && (att(l, 'text', 'continue-numbering') === 'true' || !!att(l, 'text', 'continue-list'));
+}
+
+function mergeList(l1: Element, between: Element[], l2: Element): void {
+  const item1 = lastItem(l1);
+  const head = firstItem(l2)!;
+  if (!item1) return;
+  const nested1 = elKids(item1).pop();
+  const nested2 = elKids(head)[0];
+  let rest = Array.from(head.childNodes);
+  if (nested1 && qn(nested1) === 'text:list' && nested2 && qn(nested2) === 'text:list' && continues(nested2)) {
+    mergeList(nested1, between, nested2);
+    rest = rest.filter((n) => n !== nested2);
+  } else for (const b of between) item1.appendChild(b);
+  for (const n of rest) item1.appendChild(n);
+  head.remove();
+  for (const n of Array.from(l2.childNodes)) l1.appendChild(n);
+  l2.remove();
+}
+
 function parseXml(text: string): Document | null {
   try {
     const d = new DOMParser().parseFromString(text, 'application/xml');
@@ -1772,7 +1902,7 @@ function fallbackText(xml: string): PMNode {
 export async function importOdt(data: ArrayBuffer, name: string): Promise<PMNode> {
   void name;
   let zip: JSZip;
-  try { zip = await JSZip.loadAsync(data); } catch { return importFodt(data, name); }
+  try { zip = await loadZip(data); } catch { return importFodt(data, name); }
   const files = new Map<string, Uint8Array>();
   const read = async (p: string) => { const f = zip.file(p); return f ? f.async('string') : null; };
   const contentXml = await read('content.xml');

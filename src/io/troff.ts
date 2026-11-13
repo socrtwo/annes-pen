@@ -200,7 +200,7 @@ class ManReader {
         case 'TH': case 'Dt': {
           const title = `${a[0] || ''}${a[1] ? `(${a[1]})` : ''}`;
           this.settings.properties.title = title;
-          this.out.push(p([schema.text(title)], { style: 'Title' }));
+          if (title) this.out.push(p([schema.text(title)], { style: 'Title' }));
           this.settings.header = { left: title, center: a[4] || '', right: title };
           this.settings.footer = { left: a[3] || '', center: a[2] || '', right: '{PAGE}' };
           break;
@@ -209,7 +209,8 @@ class ManReader {
           this.endPara(); this.flushList(); this.indent = 0;
           let t = a.join(' ');
           if (!t && k + 1 < lines.length && !lines[k + 1].req) { t = lines[++k].text; }
-          this.out.push(p([schema.text(t.replace(/\\(.)/g, (_m, c) => (c === '-' ? '-' : '')))], { style: headingStyle(ln.req.toUpperCase() === 'SH' ? 1 : 2) }));
+          t = t.replace(/\\(.)/g, (_m, c) => (c === '-' ? '-' : ''));
+          if (t) this.out.push(p([schema.text(t)], { style: headingStyle(ln.req.toUpperCase() === 'SH' ? 1 : 2) }));
           break;
         }
         case 'PP': case 'LP': case 'P': case 'Pp': this.endPara(); this.flushList(); break;

@@ -338,7 +338,7 @@ public class QuillNativePlugin extends Plugin {
         }
         io.execute(() -> {
             try {
-                writeBytes(Uri.parse(uriString), decodeBase64(data));
+                writeBytes(checkedUri(Uri.parse(uriString)), decodeBase64(data));
                 JSObject ret = new JSObject();
                 ret.put("ok", true);
                 call.resolve(ret);
@@ -357,7 +357,7 @@ public class QuillNativePlugin extends Plugin {
         }
         io.execute(() -> {
             try {
-                call.resolve(readDocument(Uri.parse(uriString), null));
+                call.resolve(readDocument(checkedUri(Uri.parse(uriString)), null));
             } catch (Throwable e) {
                 call.reject("Could not read document: " + e.getMessage(), asException(e));
             }
@@ -486,7 +486,7 @@ public class QuillNativePlugin extends Plugin {
         io.execute(() -> {
             try {
                 Uri uri = null;
-                if (uriStr != null && uriStr.startsWith("content:")) uri = Uri.parse(uriStr);
+                if (uriStr != null && uriStr.startsWith("content:")) uri = checkedUri(Uri.parse(uriStr));
                 if (uri == null) {
                     if (data == null) throw new IOException("No file to open");
                     File dir = new File(context.getCacheDir(), SHARE_DIR);
@@ -639,6 +639,7 @@ public class QuillNativePlugin extends Plugin {
         if (uri == null) {
             return null;
         }
+        checkedUri(uri);
         takePersistablePermission(uri);
         return readDocument(uri, intent.getType());
     }
@@ -657,6 +658,20 @@ public class QuillNativePlugin extends Plugin {
     // ---------------------------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------------------------
+
+    /**
+     * Only content: URIs from other apps' providers. file: URIs and our own providers (FileProvider,
+     * embed provider) would let another app or a crafted intent reach this app's private files.
+     */
+    private Uri checkedUri(Uri uri) throws IOException {
+        String authority = uri.getAuthority();
+        String pkg = getContext().getPackageName();
+        if (!ContentResolver.SCHEME_CONTENT.equals(uri.getScheme()) || authority == null
+                || authority.equals(pkg) || authority.startsWith(pkg + ".")) {
+            throw new IOException("Unsupported document location");
+        }
+        return uri;
+    }
 
     private JSObject readDocument(Uri uri, String hintMime) throws IOException {
         ContentResolver resolver = getContext().getContentResolver();

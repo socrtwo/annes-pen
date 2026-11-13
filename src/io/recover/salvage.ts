@@ -14,7 +14,7 @@
  * consistent, and balanceXml() rebuilds a well-formed tree from tag soup (mis-nested and
  * truncated elements, stray ampersands, duplicate attributes, undeclared prefixes).
  */
-import { immortalInflate, crc32, type InflateResult } from './inflate';
+import { immortalInflate, inflateLimit, crc32, type InflateResult } from './inflate';
 
 export interface SalvagedEntry {
   data: Uint8Array;
@@ -75,8 +75,10 @@ export function scanZipBytes(u8: Uint8Array): Map<string, SalvagedEntry> {
     if (meth === 0) data = raw;
     else {
       let best: InflateResult = { data: new Uint8Array(0), isCorrupt: true }, bestScore = 0, bestShift = 0;
+      // Up to 48 attempts per entry: each one's output is bounded by the entry's size.
+      const maxOutput = inflateLimit(raw.length);
       for (let shift = 0; shift < 48 && shift < raw.length; shift++) {
-        const r = immortalInflate(raw.subarray(shift));
+        const r = immortalInflate(raw.subarray(shift), { maxOutput });
         if (!r.data.length) continue;
         if (shift === 0 && !r.isCorrupt) { best = r; break; }
         const score = rateQuality(r.data, name) + (r.isCorrupt ? 0 : 100);
@@ -86,7 +88,7 @@ export function scanZipBytes(u8: Uint8Array): Map<string, SalvagedEntry> {
       if (!best.isCorrupt && crc && !(flags & 0x08) && crc32(best.data) !== crc) best = { ...best, isCorrupt: true };
       // A damaged XML stream: skip the bad region and keep decoding the deflate blocks after it.
       if (best.isCorrupt && /\.(xml|rels)$/i.test(name)) {
-        const r = immortalInflate(raw.subarray(bestShift), { resync: true, validateText: true, strictBlocks: true });
+        const r = immortalInflate(raw.subarray(bestShift), { resync: true, validateText: true, strictBlocks: true, maxOutput });
         if (r.data.length > best.data.length * 0.5 || r.gaps) best = { ...r, isCorrupt: true };
       }
       data = best.data; isCorrupt = best.isCorrupt;

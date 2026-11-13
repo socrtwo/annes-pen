@@ -58,6 +58,8 @@ interface DesktopBridge extends QuillNativePlugin {
   openWith(opts: { app: string; uri?: string | null; name: string; data?: string }): Promise<{ ok: boolean; app: string; handler?: string; error?: string }>;
   /** HTTP from the main process (no CORS), for AI providers that block browsers. */
   http(opts: { url: string; method: string; headers: Record<string, string>; data?: unknown }): Promise<{ status: number; text: string }>;
+  /** encrypted: false when the system has no keychain (some Linux desktops): keys are stored unencrypted. */
+  secureInfo?(): Promise<{ encrypted: boolean }>;
 }
 
 const desktop: DesktopBridge | undefined = typeof window !== 'undefined' ? (window as any).quillDesktop : undefined;
@@ -323,6 +325,11 @@ export async function secureGet(key: string): Promise<string | null> {
 }
 export async function secureRemove(key: string): Promise<void> {
   await Native.secureRemove({ key });
+}
+/** Whether secureSet encrypts: false only on a desktop without a system keychain (the AI settings can warn). */
+export async function secureStorageEncrypted(): Promise<boolean> {
+  if (!desktop?.secureInfo) return true;
+  try { return (await desktop.secureInfo()).encrypted; } catch { return true; }
 }
 
 /** Read clipboard text. Returns null when the platform refuses (no permission, no focus). */

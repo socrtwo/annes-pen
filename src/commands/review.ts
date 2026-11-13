@@ -1,6 +1,7 @@
 /** Review tab: proofing, comments, tracking, changes, compare, protect, accessibility, speech. */
 import { def } from './registry';
-import type { App } from '../app';
+import { trackPositions, type App } from '../app';
+import { hashPassword, verifyPassword } from '../util/crypto';
 import { Fragment, Mark, type Node as PMNode } from 'prosemirror-model';
 import type { EditorState, Transaction } from 'prosemirror-state';
 import { normalizeSettings } from '../editor/settings';
@@ -145,6 +146,7 @@ def([
       const synth = window.speechSynthesis;
       if (!synth) { toast('Text-to-speech is not available on this device.'); return; }
       if (speaking) { synth.cancel(); speaking = false; keepAwake(false); app.refresh(); return; }
+      const tab = app.tab;
       const st = app.state;
       const from = st.selection.empty ? st.selection.from : st.selection.from;
       const to = st.selection.empty ? st.doc.content.size : st.selection.to;
@@ -153,7 +155,8 @@ def([
       keepAwake(true);
       app.refresh();
       for (const b of blocks) {
-        if (!speaking) break;
+        // Stop when switched off or when another document became active.
+        if (!speaking || app.tab !== tab) { synth.cancel(); break; }
         app.selectPos(b.pos + 1);
         await new Promise<void>((res) => {
           const u = new SpeechSynthesisUtterance(b.text.replace(/￼/g, ' '));
@@ -235,12 +238,16 @@ def([
       let { from, to } = st.selection;
       if (from === to) { const w = wordAt(st.selection.$head); if (w) { from = w.from; to = w.to; } }
       if (from === to) { toast('Select text or place the cursor in a word to comment on it.'); return; }
+      const pt = trackPositions(app);
       const text = await promptDialog('New Comment', `Comment on “${st.doc.textBetween(from, to).slice(0, 60)}”:`, '', { type: 'textarea' as any, rows: 4 } as any);
-      if (!text) return;
+      pt.done();
+      if (!text || pt.lost) return;
+      const a = pt.map(from, 1), b = pt.map(to, -1);
+      if (b <= a) { toast('The text you were commenting on was deleted.'); return; }
       const id = `cm${Date.now().toString(36)}`;
       const s = JSON.parse(JSON.stringify(app.settings));
       s.comments[id] = { id, author: app.prefs.author, date: Date.now(), text, resolved: false, replies: [] };
-      const tr = app.state.tr.addMark(from, to, M.comment.create({ id })).setDocAttribute('settings', s).setMeta('comment', true).setMeta('trackSkip', true);
+      const tr = app.state.tr.addMark(a, b, M.comment.create({ id })).setDocAttribute('settings', s).setMeta('comment', true).setMeta('trackSkip', true);
       v(app).dispatch(tr);
       app.ui.openPane('comments');
     },
@@ -461,7 +468,7 @@ def([
     id: 'review.restrictEditing', label: 'Restrict Editing…', icon: 'shield_lock', tab: 'Review', group: 'Protect', popular: true,
     run: async (app) => {
       const p = app.settings.protection;
-      const r = await openDialog({ title: 'Restrict Editing', fields: [
+      const r = await openDialog({ title: 'Restrict Editing', help: 'Restriction is advisory: it prevents accidental changes in Anne\'s Pen, but anyone can edit the file with another program.', fields: [
         { key: 'mode', label: 'Allow only this type of editing', type: 'radio', options: [{ value: 'none', label: 'No restrictions' }, { value: 'tracked', label: 'Tracked changes' }, { value: 'comments', label: 'Comments' }, { value: 'forms', label: 'Filling in forms' }, { value: 'readonly', label: 'No changes (read only)' }], value: p.mode },
         { key: 'pw', label: 'Password (optional)', type: 'password', value: '' },
       ] });
@@ -469,9 +476,9 @@ def([
       // Changing the mode or the password needs the current password.
       if (p.hash && (r.mode !== p.mode || r.pw)) {
         const pw = await promptDialog(r.mode !== p.mode ? 'Unprotect Document' : 'Change Password', 'Current password:', '', { type: 'password' });
-        if (pw == null || (await sha(pw)) !== p.hash) { toast('Incorrect password.'); return; }
+        if (pw == null || !(await verifyPassword(pw, p.hash))) { toast('Incorrect password.'); return; }
       }
-      const hash = r.pw ? await sha(r.pw) : r.mode === 'none' ? undefined : p.hash;
+      const hash = r.pw ? await hashPassword(r.pw) : r.mode === 'none' ? undefined : p.hash;
       const tr = app.state.tr.setDocAttribute('settings', { ...JSON.parse(JSON.stringify(app.settings)), protection: { mode: r.mode, hash } }).setMeta('allowProtected', true).setMeta('trackSkip', true);
       v(app).dispatch(tr);
       app.view.setProps({});

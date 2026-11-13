@@ -8,6 +8,7 @@ import type { Source } from '../editor/settings';
 import { insertBlock, insertInline, selectedText, setParaAttrs, currentParagraph } from '../editor/ops';
 import { pageOfPos } from '../editor/plugins/pagination';
 import { footnoteLabel } from '../editor/plugins/decorations';
+import { displayPage } from '../editor/fields';
 import { openDialog, toast, promptDialog } from '../ui/dialog';
 import { esc } from '../ui/dom';
 import { sanitizeGeneratedHtml } from '../util/sanitize';
@@ -16,69 +17,148 @@ import { slug } from './edit';
 const N = schema.nodes;
 const v = (app: App) => app.view;
 
+/** Where `node` (found at `pos` before an await) is now, or -1 if it changed or went away. */
+function relocate(app: App, pos: number, node: PMNode): number {
+  const doc = app.state.doc;
+  if (pos >= 0 && pos < doc.content.size && doc.nodeAt(pos) === node) return pos;
+  let found = -1;
+  doc.descendants((n, p) => { if (found >= 0) return false; if (n === node) found = p; return found < 0; });
+  return found;
+}
+
 // ------------------------------------------------------------------------------------------
 // Citation formatting
 
 export const CITATION_STYLES = ['APA', 'MLA', 'Chicago', 'Turabian', 'Harvard', 'IEEE', 'ISO 690', 'GB7714'];
 export const SOURCE_TYPES = ['Book', 'Book Section', 'Journal Article', 'Article in a Periodical', 'Conference Proceedings', 'Report', 'Web Site', 'Document from Web Site', 'Thesis', 'Film', 'Interview', 'Patent', 'Case', 'Statute', 'Manuscript / Archival', 'Census Record', 'Vital Record', 'Church Record', 'Miscellaneous'];
 
-function authorsList(a: string): { first: string; last: string }[] {
-  return a.split(/;|\s+and\s+/).map((s) => s.trim()).filter(Boolean).map((s) => {
-    if (s.includes(',')) { const [last, first] = s.split(',').map((x) => x.trim()); return { first, last }; }
-    const parts = s.split(/\s+/); const last = parts.pop() || ''; return { first: parts.join(' '), last };
-  });
+type Person = { first: string; last: string; literal?: boolean };
+
+// Corporate authors: {Braced} as in BibTeX, or a name that reads like an organisation.
+const CORPORATE = /\b(Organi[sz]ations?|Associations?|Institutes?|Inc|Ltd|Universit(y|ies)|Departments?|Committees?|Groups?|Agenc(y|ies)|Councils?|Societ(y|ies)|Foundations?)\b/i;
+
+/** Splits an author list on ";" or " and ", ignoring separators inside {braces}. */
+function splitAuthors(a: string): string[] {
+  const out: string[] = [];
+  let depth = 0, cur = '';
+  for (let i = 0; i < a.length; i++) {
+    const c = a[i];
+    if (c === '{') depth++;
+    else if (c === '}') depth = Math.max(0, depth - 1);
+    if (depth === 0 && c === ';') { out.push(cur); cur = ''; continue; }
+    if (depth === 0 && /\s/.test(c)) {
+      const m = /^\s+and\s+/i.exec(a.slice(i));
+      if (m) { out.push(cur); cur = ''; i += m[0].length - 1; continue; }
+    }
+    cur += c;
+  }
+  out.push(cur);
+  return out.map((s) => s.trim()).filter(Boolean);
 }
-const initials = (f: string) => f.split(/[\s-]+/).filter(Boolean).map((x) => x[0].toUpperCase() + '.').join(' ');
+
+/** True when the whole string is one {braced} group. */
+function wholly(s: string): boolean {
+  if (s[0] !== '{') return false;
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '{') depth++;
+    else if (s[i] === '}' && --depth === 0) return i === s.length - 1;
+  }
+  return false;
+}
+
+function authorsList(a: string): Person[] {
+  const raw = (a || '').trim();
+  if (!raw) return [];
+  // "Simon and Schuster Inc" is one publisher, not two people.
+  if (!/[;,{]/.test(raw) && CORPORATE.test(raw)) return [{ first: '', last: raw, literal: true }];
+  const names = splitAuthors(raw);
+  return names.map((s): Person => {
+    if (wholly(s)) return { first: '', last: s.slice(1, -1).replace(/[{}]/g, '').trim(), literal: true };
+    s = s.replace(/[{}]/g, '');
+    if (s.includes(',')) { const [last, ...rest] = s.split(',').map((x) => x.trim()); return { first: rest.join(' ').trim(), last }; }
+    const parts = s.split(/\s+/);
+    if (CORPORATE.test(s) || (names.length === 1 && parts.length >= 3)) return { first: '', last: s, literal: true };
+    const last = parts.pop() || ''; return { first: parts.join(' '), last };
+  }).filter((p) => p.last || p.first);
+}
+const initials = (f: string) => f.split(/[\s.-]+/).filter(Boolean).map((x) => x[0].toUpperCase() + '.').join(' ');
+/** "Last, First" with the comma only when there is a first name. */
+const lastFirst = (last: string, first: string) => (first ? `${last}, ${first}` : last);
+const firstLast = (first: string, last: string) => [first, last].filter(Boolean).join(' ');
 
 export function formatAuthors(a: string, style: string): string {
   const list = authorsList(a);
   if (!list.length) return '';
   switch (style) {
     case 'APA': case 'Harvard': {
-      const f = list.map((p) => `${p.last}, ${initials(p.first)}`);
-      return f.length === 1 ? f[0] : f.slice(0, -1).join(', ') + ', & ' + f[f.length - 1];
+      const f = list.map((p) => (p.literal ? p.last : lastFirst(p.last, initials(p.first))));
+      if (f.length === 1) return f[0];
+      // APA puts a comma before & after initials ("Smith, J., & Doe, J."), not after bare names.
+      const sep = f.length > 2 || /\.$/.test(f[f.length - 2]) ? ', & ' : ' & ';
+      return f.slice(0, -1).join(', ') + sep + f[f.length - 1];
     }
-    case 'IEEE': return list.map((p) => `${initials(p.first)} ${p.last}`).join(', ');
-    case 'MLA': return list.length === 1 ? `${list[0].last}, ${list[0].first}` : list.length === 2 ? `${list[0].last}, ${list[0].first}, and ${list[1].first} ${list[1].last}` : `${list[0].last}, ${list[0].first}, et al.`;
-    default: return list.map((p, i) => (i === 0 ? `${p.last}, ${p.first}` : `${p.first} ${p.last}`)).join(list.length > 2 ? ', ' : ' and ');
+    case 'IEEE': return list.map((p) => (p.literal ? p.last : firstLast(initials(p.first), p.last))).join(', ');
+    case 'MLA': {
+      const inv = (p: Person) => (p.literal ? p.last : lastFirst(p.last, p.first));
+      const fwd = (p: Person) => (p.literal ? p.last : firstLast(p.first, p.last));
+      return list.length === 1 ? inv(list[0]) : list.length === 2 ? `${inv(list[0])}, and ${fwd(list[1])}` : `${inv(list[0])}, et al.`;
+    }
+    default: return list.map((p, i) => (p.literal ? p.last : i === 0 ? lastFirst(p.last, p.first) : firstLast(p.first, p.last))).join(list.length > 2 ? ', ' : ' and ');
   }
 }
 
+/** Ends a bibliography segment with a full stop (unless it already ends with one). */
+const sentence = (x: string) => (!x ? '' : /[.?!]["'”’]?$|[.?!]<\/i>$/.test(x) ? x : x + '.');
+const segs = (...xs: (string | false | null | undefined)[]) => xs.map((x) => sentence(x || '')).filter(Boolean).join(' ');
+const list = (...xs: (string | false | null | undefined)[]) => xs.filter(Boolean).join(', ');
+
 export function formatBibEntry(s: Source, style: string, n?: number): string {
-  const au = formatAuthors(s.author || '', style);
+  const auRaw = formatAuthors(s.author || '', style);
+  const au = esc(auRaw);
   const t = s.title ? esc(s.title) : '';
-  const it = (x: string) => `<i>${x}</i>`;
+  const it = (x: string) => (x ? `<i>${x}</i>` : '');
   const book = /Book$|Report|Thesis|Film|Manuscript/.test(s.type) || !s.journal;
   const pub = [s.city, s.publisher].filter(Boolean).map((x) => esc(x!)).join(': ');
-  const url = s.url ? ` ${esc(s.url)}` : '';
-  const doi = s.doi ? ` https://doi.org/${esc(s.doi)}` : '';
-  const vi = [s.volume ? esc(s.volume) : '', s.issue ? `(${esc(s.issue)})` : ''].join('');
+  const url = s.url ? esc(s.url) : '';
+  const doi = s.doi ? `https://doi.org/${esc(s.doi)}` : '';
+  const y = s.year ? esc(s.year) : '';
+  const j = s.journal ? esc(s.journal) : '';
+  const vol = s.volume ? esc(s.volume) : '', iss = s.issue ? esc(s.issue) : '', pg = s.pages ? esc(s.pages) : '';
+  const vi = vol + (iss ? `(${iss})` : '');
+  const tail = (x: string) => (x ? ' ' + x : '');
   switch (style) {
     case 'APA':
-      return book ? `${esc(au)} (${esc(s.year || 'n.d.')}). ${it(t)}${s.edition ? ` (${esc(s.edition)} ed.)` : ''}. ${esc(s.publisher || '')}.${doi || url}`
-        : `${esc(au)} (${esc(s.year || 'n.d.')}). ${t}. ${it(esc(s.journal || ''))}${vi ? ', ' + it(vi) : ''}${s.pages ? ', ' + esc(s.pages) : ''}.${doi || url}`;
+      return segs(`${au ? au + ' ' : ''}(${y || 'n.d.'})`, book ? it(t) + (s.edition ? ` (${esc(s.edition)} ed.)` : '') : t, book ? esc(s.publisher || '') : list(it(j), vol && it(vol) + (iss ? `(${iss})` : ''), pg)) + tail(doi || url);
     case 'MLA':
-      return book ? `${esc(au)}. ${it(t)}. ${esc(s.publisher || '')}, ${esc(s.year || '')}.${url}`
-        : `${esc(au)}. "${t}." ${it(esc(s.journal || ''))}${s.volume ? `, vol. ${esc(s.volume)}` : ''}${s.issue ? `, no. ${esc(s.issue)}` : ''}, ${esc(s.year || '')}${s.pages ? `, pp. ${esc(s.pages)}` : ''}.${url}`;
-    case 'IEEE':
-      return `[${n ?? '?'}] ${esc(au)}, ${book ? it(t) : `"${t},"`} ${book ? `${pub}, ${esc(s.year || '')}` : `${it(esc(s.journal || ''))}, vol. ${esc(s.volume || '')}, no. ${esc(s.issue || '')}, pp. ${esc(s.pages || '')}, ${esc(s.year || '')}`}.${doi}`;
-    case 'Harvard':
-      return `${esc(au)} (${esc(s.year || 'n.d.')}) ${book ? it(t) : `'${t}', ${it(esc(s.journal || ''))}, ${vi}${s.pages ? `, pp. ${esc(s.pages)}` : ''}`}. ${pub}.${url ? ` Available at:${url}` : ''}${s.accessed ? ` (Accessed: ${esc(s.accessed)})` : ''}`;
+      return segs(au, book ? it(t) : t && `"${t}."`, book ? list(esc(s.publisher || ''), y) : list(it(j), vol && `vol. ${vol}`, iss && `no. ${iss}`, y, pg && `pp. ${pg}`)) + tail(url);
+    case 'IEEE': {
+      const num = `[${n ?? '?'}] `;
+      if (book) return num + segs(list(au, it(t)), list(pub, y)) + tail(doi);
+      const rest = list(it(j), vol && `vol. ${vol}`, iss && `no. ${iss}`, pg && `pp. ${pg}`, y);
+      const title = t ? (rest ? `"${t},"` : `"${t}."`) : '';
+      return num + sentence(title ? [list(au, title), rest].filter(Boolean).join(' ') : list(au, rest)) + tail(doi);
+    }
+    case 'Harvard': {
+      const body = book ? it(t) : list(t && `'${t}'`, it(j), vi, pg && `pp. ${pg}`);
+      return segs(`${au ? au + ' ' : ''}(${y || 'n.d.'})${body ? ' ' + body : ''}`, book && pub) + (url ? ` Available at: ${url}` : '') + (s.accessed ? ` (Accessed: ${esc(s.accessed)})` : '');
+    }
     case 'ISO 690':
-      return `${esc(au.toUpperCase())}. ${book ? it(t) : `${t}. ${it(esc(s.journal || ''))}`}. ${pub}, ${esc(s.year || '')}.${url}`;
+      return segs(esc(auRaw.toUpperCase()), book ? it(t) : t, !book && it(j), book ? list(pub, y) : list(y, vol && `vol. ${vol}`, iss && `no. ${iss}`, pg && `pp. ${pg}`)) + tail(url);
     case 'GB7714':
-      return `[${n ?? '?'}] ${esc(au)}. ${t}[${book ? 'M' : 'J'}]. ${book ? pub : esc(s.journal || '')}, ${esc(s.year || '')}${s.pages ? ': ' + esc(s.pages) : ''}.`;
+      return `[${n ?? '?'}] ` + segs(au, t && `${t}[${book ? 'M' : 'J'}]`, list(book ? pub : j, y, !book && vi) + (pg ? `: ${pg}` : ''));
     default: // Chicago / Turabian (notes-bibliography)
-      return book ? `${esc(au)}. ${it(t)}. ${pub}, ${esc(s.year || '')}.${url}`
-        : `${esc(au)}. "${t}." ${it(esc(s.journal || ''))} ${esc(s.volume || '')}${s.issue ? `, no. ${esc(s.issue)}` : ''} (${esc(s.year || '')})${s.pages ? ': ' + esc(s.pages) : ''}.${doi || url}`;
+      return book ? segs(au, it(t), list(pub, y)) + tail(url)
+        : segs(au, t && `"${t}."`, [it(j), vol].filter(Boolean).join(' ') + (iss ? `, no. ${iss}` : '') + (y ? ` (${y})` : '') + (pg ? `: ${pg}` : '')) + tail(doi || url);
   }
 }
 
 export function formatInText(sources: Source[], style: string, page: string | null, numberOf: (id: string) => number): string {
   if (!sources.length) return '(Unknown source)';
   const parts = sources.map((s) => {
-    const last = authorsList(s.author || '')[0]?.last || s.title?.split(' ').slice(0, 3).join(' ') || 'Anon.';
-    const many = authorsList(s.author || '').length > 2 ? ' et al.' : authorsList(s.author || '').length === 2 ? ` & ${authorsList(s.author)[1].last}` : '';
+    const people = authorsList(s.author || '');
+    const last = people[0]?.last || s.title?.split(' ').slice(0, 3).join(' ') || 'Anon.';
+    const many = people.length > 2 ? ' et al.' : people.length === 2 ? ` & ${people[1].last}` : '';
     switch (style) {
       case 'MLA': return `${last}${many.replace('&', 'and')}${page ? ' ' + page : ''}`;
       case 'IEEE': case 'GB7714': return `${numberOf(s.id)}`;
@@ -133,7 +213,7 @@ export function generateBlock(app: App, kind: string, options: Record<string, an
   const st = app.state;
   const s = app.settings;
   const paged = app.tab.viewMode === 'print';
-  const pg = (pos: number) => (paged ? String(pageOfPos(st, pos)) : '');
+  const pg = (pos: number) => (paged ? displayPage(pageOfPos(st, pos), s) : '');
   const leader = options.leader || 'dot';
   const row = (text: string, page: string, cls: string, href?: string) =>
     `<p class="qf-toc-row ${cls} qf-leader-${leader}">${href ? `<a href="#${href}">` : ''}<span class="qf-toc-text">${esc(text)}</span>${href ? '</a>' : ''}${options.pages !== false && page ? `<span class="qf-toc-page">${page}</span>` : ''}</p>`;
@@ -348,7 +428,8 @@ def([
         { key: 'text', label: 'Text', type: 'textarea', rows: 5, value: node.attrs.text },
         { key: 'mark', label: 'Custom mark (blank = automatic number)', type: 'text', value: node.attrs.mark || '' },
       ], buttons: [{ label: 'Delete Note', onClick: (_v, ctl) => { v(app).dispatch(app.state.tr.delete(pos, pos + 1)); ctl.close(); } }] });
-      if (r) { v(app).dispatch(app.state.tr.setNodeMarkup(pos, undefined, { ...node.attrs, text: r.text, mark: r.mark || null })); updateGenerated(app); }
+      const at = r ? relocate(app, pos, node) : -1;
+      if (r && at >= 0) { v(app).dispatch(app.state.tr.setNodeMarkup(at, undefined, { ...node.attrs, text: r.text, mark: r.mark || null })); updateGenerated(app); }
     },
   },
 ]);
@@ -413,7 +494,9 @@ def([
         { key: 'page', label: 'Page(s)', type: 'text', value: node.attrs.page || '' },
       ], buttons: [{ label: 'Delete', onClick: (_v, ctl) => { v(app).dispatch(app.state.tr.delete(pos, pos + 1)); ctl.close(); } }] });
       if (!r) return;
-      v(app).dispatch(app.state.tr.setNodeMarkup(pos, undefined, { ...node.attrs, sources: (r.ids || []).join(','), page: r.page || null }));
+      const at = relocate(app, pos, node);
+      if (at < 0) return;
+      v(app).dispatch(app.state.tr.setNodeMarkup(at, undefined, { ...node.attrs, sources: (r.ids || []).join(','), page: r.page || null }));
       refreshCitations(app);
     },
   },
@@ -573,15 +656,25 @@ export function parseBibtex(src: string): Source[] {
       fields[name] = value(close);
     }
     const f = (k: string) => (fields[k] == null ? undefined : bibText(fields[k], k === 'url' || k === 'doi'));
-    out.push({ id: key || `src${out.length}`, type: TYPES[kind] || 'Miscellaneous', author: (f('author') || '').replace(/\s+and\s+/g, '; '), title: f('title') || '', year: f('year') || '', publisher: f('publisher') || f('school') || f('institution'), city: f('address'), journal: f('journal') || f('booktitle'), volume: f('volume'), issue: f('number'), pages: f('pages')?.replace('--', '–'), url: f('url'), doi: f('doi'), edition: f('edition') });
+    // Names in {braces} are corporate authors: keep the braces so formatting does not invert them.
+    const author = fields.author == null ? '' : splitAuthors(fields.author).map((x) => (wholly(x) ? `{${bibText(x.slice(1, -1))}}` : bibText(x))).filter((x) => x && x !== '{}').join('; ');
+    out.push({ id: key || `src${out.length}`, type: TYPES[kind] || 'Miscellaneous', author, title: f('title') || '', year: f('year') || '', publisher: f('publisher') || f('school') || f('institution'), city: f('address'), journal: f('journal') || f('booktitle'), volume: f('volume'), issue: f('number'), pages: f('pages')?.replace('--', '–'), url: f('url'), doi: f('doi'), edition: f('edition') });
   }
   return out;
+}
+
+/** Author list for BibTeX: " and " between names, corporate names in braces. */
+function bibAuthor(a?: string): string | undefined {
+  if (!a?.trim()) return a;
+  const people = authorsList(a);
+  if (people.length === 1 && people[0].literal) return wholly(a.trim()) ? a.trim() : `{${a.trim()}}`;
+  return splitAuthors(a).map((x) => (!wholly(x) && !x.includes(',') && CORPORATE.test(x) ? `{${x}}` : x)).join(' and ');
 }
 
 export function toBibtex(list: Source[]): string {
   const map: Record<string, string> = { Book: 'book', 'Journal Article': 'article', 'Conference Proceedings': 'inproceedings', 'Book Section': 'incollection', Thesis: 'phdthesis', Report: 'techreport', 'Web Site': 'online' };
   return list.map((s) => {
-    const f: [string, string | undefined][] = [['author', s.author?.replace(/;\s*/g, ' and ')], ['title', s.title], ['year', s.year], ['journal', s.journal], ['volume', s.volume], ['number', s.issue], ['pages', s.pages], ['publisher', s.publisher], ['address', s.city], ['url', s.url], ['doi', s.doi]];
+    const f: [string, string | undefined][] = [['author', bibAuthor(s.author)], ['title', s.title], ['year', s.year], ['journal', s.journal], ['volume', s.volume], ['number', s.issue], ['pages', s.pages], ['publisher', s.publisher], ['address', s.city], ['url', s.url], ['doi', s.doi]];
     return `@${map[s.type] || 'misc'}{${s.id},\n${f.filter(([, x]) => x).map(([k, x]) => `  ${k} = {${x}}`).join(',\n')}\n}`;
   }).join('\n\n');
 }
@@ -624,11 +717,14 @@ def([
   {
     id: 'refs.crossReference', label: 'Cross-reference…', icon: 'link', tab: 'References', group: 'Captions', edits: true, popular: true,
     run: async (app) => {
-      const st = app.state;
-      const heads = headingList(st.doc, 9);
-      const bms: string[] = []; st.doc.descendants((n) => { if (n.type === N.bookmark) bms.push(n.attrs.name); return true; });
-      const caps: { text: string; pos: number; node: PMNode }[] = []; st.doc.descendants((n, pos) => { if (n.type === N.paragraph && n.attrs.style === 'Caption') caps.push({ text: n.textContent, pos, node: n }); return true; });
-      const notes: { text: string; pos: number }[] = []; st.doc.descendants((n, pos) => { if (n.type === N.footnote) notes.push({ text: n.attrs.text, pos }); return true; });
+      const targets = (doc: PMNode) => {
+        const bms: string[] = []; doc.descendants((n) => { if (n.type === N.bookmark) bms.push(n.attrs.name); return true; });
+        const caps: { text: string; pos: number; node: PMNode }[] = []; doc.descendants((n, pos) => { if (n.type === N.paragraph && n.attrs.style === 'Caption') caps.push({ text: n.textContent, pos, node: n }); return true; });
+        const notes: { text: string; pos: number }[] = []; doc.descendants((n, pos) => { if (n.type === N.footnote) notes.push({ text: n.attrs.text, pos }); return true; });
+        return { heads: headingList(doc, 9), bms, caps, notes };
+      };
+      const before = app.state.doc;
+      const { heads, bms, caps, notes } = targets(before);
       const r = await openDialog({ title: 'Cross-reference', wide: true, fields: [
         { key: 'type', label: 'Reference type', type: 'select', options: ['Heading', 'Bookmark', 'Caption', 'Footnote'], value: 'Heading', half: true },
         { key: 'what', label: 'Insert reference to', type: 'select', options: [{ value: 'text', label: 'Text' }, { value: 'page', label: 'Page number' }, { value: 'above', label: 'Above/below' }], value: 'text', half: true },
@@ -641,12 +737,19 @@ def([
       } });
       if (!r?.target) return;
       const t = String(r.target);
+      // The document may have changed while the dialog was open: resolve the target again in
+      // the current state (same kind and index, same text) and build the transaction from it.
+      const st = app.state;
+      const now = st.doc === before ? { heads, bms, caps, notes } : targets(st.doc);
+      const idx = +t.slice(1);
+      const same = t[0] === 'h' ? now.heads[idx]?.text === heads[idx]?.text : t[0] === 'c' ? now.caps[idx]?.text === caps[idx]?.text : t[0] === 'n' ? now.notes[idx]?.text === notes[idx]?.text : true;
+      if (!same) { toast('The document changed. Choose the cross-reference again.'); return; }
       let name = '', text = '', pos = 0;
       let capId: { pos: number; node: PMNode } | null = null;
-      if (t[0] === 'h') { const h0 = heads[+t.slice(1)]; text = h0.text; pos = h0.pos; name = slug(h0.text); }
+      if (t[0] === 'h') { const h0 = now.heads[idx]; text = h0.text; pos = h0.pos; name = slug(h0.text); }
       if (t[0] === 'b') { name = t.slice(1); }
       if (t[0] === 'c') {
-        const c = caps[+t.slice(1)]; text = c.text.split(':')[0]; pos = c.pos;
+        const c = now.caps[idx]; text = c.text.split(':')[0]; pos = c.pos;
         // nav.gotoAnchor resolves paragraph ids, so link to the caption's id (giving it a unique one if needed).
         name = c.node.attrs.id || '';
         if (!name) {
@@ -656,17 +759,17 @@ def([
           capId = { pos: c.pos, node: c.node };
         }
       }
-      if (t[0] === 'n') { const nn = notes[+t.slice(1)]; text = footnoteLabel(st, nn.pos) || ''; pos = nn.pos; }
+      if (t[0] === 'n') { const nn = now.notes[idx]; text = footnoteLabel(st, nn.pos) || ''; pos = nn.pos; }
       const view = v(app);
       if (t[0] === 'b') {
         insertInline(view, N.field.create({ type: r.what === 'page' ? 'PAGEREF' : 'REF', arg: name }));
         app.updateFields();
         return;
       }
-      if (r.what === 'page') text = String(pageOfPos(st, pos));
+      if (r.what === 'page') text = displayPage(pageOfPos(st, pos), app.settings);
       if (r.what === 'above') text = pos < st.selection.from ? 'above' : 'below';
       const marks = r.link && name ? [schema.marks.link.create({ href: '#' + name })] : [];
-      const tr = view.state.tr;
+      const tr = st.tr;
       if (capId && r.link) tr.setNodeMarkup(capId.pos, undefined, { ...capId.node.attrs, id: name });
       view.dispatch(tr.replaceSelectionWith(schema.text(text || '?', marks), false));
     },
@@ -682,11 +785,11 @@ def([
         { key: 'all', label: 'Mark all occurrences of the main entry', type: 'checkbox', value: false },
       ] });
       if (!r?.term) return;
+      const { findMatches, buildMatcher } = await import('../editor/plugins/decorations');
       const st = app.state;
       const tr = st.tr;
       const node = () => N.index_entry.create({ term: r.term, sub: r.sub || null, see: r.see || null });
       if (r.all) {
-        const { findMatches, buildMatcher } = await import('../editor/plugins/decorations');
         const ms = findMatches(st.doc, buildMatcher(r.term, false, true, true));
         for (const m of ms.reverse()) tr.insert(m.to, node());
         toast(`${ms.length} entries marked`);

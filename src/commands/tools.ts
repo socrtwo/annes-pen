@@ -1,6 +1,6 @@
 /** Tools tab: text clean-up (OCR, typography), transformations, calculations and writing aids. */
 import { def } from './registry';
-import type { App } from '../app';
+import { trackPositions, type App } from '../app';
 import type { Node as PMNode } from 'prosemirror-model';
 import { schema } from '../editor/schema';
 import { topLevelRange, mapSelectedText, selectedText, docText, countWords, textblocks } from '../editor/ops';
@@ -234,9 +234,13 @@ def([
       const st = app.state;
       const { from, to } = scope(app);
       const md = st.doc.textBetween(from, to, '\n\n', '');
+      const pt = trackPositions(app);
       const { importMarkdown } = await import('../io/markdown');
       const doc = await importMarkdown(new TextEncoder().encode(md).buffer, 'x.md');
-      v(app).dispatch(st.tr.replaceWith(from, to, doc.content));
+      pt.done();
+      // Converted from the text as it was: if it was edited meanwhile, converting would lose that edit.
+      if (pt.changed) { toast('The document changed during the conversion. Try again.'); return; }
+      v(app).dispatch(app.state.tr.replaceWith(from, to, doc.content));
     },
   },
   {

@@ -11,9 +11,12 @@ import {
 import { resolveStyles, effectiveStyle, quickStyles, allStyles } from '../editor/styles';
 import { openDialog, colorMenu, toast, promptDialog } from '../ui/dialog';
 import { toUnit, fromUnit } from '../prefs';
+import { isNative } from '../platform/native';
 import type { Mark } from 'prosemirror-model';
 
 const M = schema.marks;
+/** Browsers keep Ctrl+T, Ctrl+Shift+N/T/W for themselves: the web build lists an alternative first (see file.ts). */
+const webKeys = (keys: string[], alt: string): string[] => (isNative() ? keys : [alt, ...keys]);
 const N = schema.nodes;
 
 export const BUNDLED_FONTS = ['Carlito', 'Caladea', 'Tinos', 'Arimo', 'Cousine', 'Gelasio', 'EB Garamond', 'Courier Prime', 'Libre Baskerville', 'Lato', 'Merriweather', 'Open Sans'];
@@ -132,7 +135,7 @@ def({
 });
 def([
   { id: 'fmt.underlineDouble', label: 'Double Underline', icon: 'format_underlined', tab: 'Home', group: 'Font', keys: ['Mod-Shift-d'], edits: true, run: (app) => setMark(v(app), M.underline, { style: 'double' }), isActive: (app) => markAttr(app.state, M.underline, 'style') === 'double' },
-  { id: 'fmt.underlineWords', label: 'Word Underline', icon: 'format_underlined', tab: 'Home', group: 'Font', keys: ['Mod-Shift-w'], edits: true, run: (app) => setMark(v(app), M.underline, { style: 'words' }) },
+  { id: 'fmt.underlineWords', label: 'Word Underline', icon: 'format_underlined', tab: 'Home', group: 'Font', keys: webKeys(['Mod-Shift-w'], 'Alt-Shift-w'), edits: true, run: (app) => setMark(v(app), M.underline, { style: 'words' }) },
   { id: 'fmt.underlineDotted', label: 'Dotted Underline', icon: 'format_underlined', tab: 'Home', group: 'Font', edits: true, run: (app) => setMark(v(app), M.underline, { style: 'dotted' }) },
   { id: 'fmt.underlineWavy', label: 'Wavy Underline', icon: 'format_underlined', tab: 'Home', group: 'Font', edits: true, run: (app) => setMark(v(app), M.underline, { style: 'wavy' }) },
   { id: 'fmt.underlineNone', label: 'Remove Underline', icon: 'format_underlined', tab: 'Home', group: 'Font', edits: true, run: (app) => removeMarks(v(app), [M.underline]) },
@@ -456,8 +459,8 @@ def([
   { id: 'para.spaceAfterToggle', label: 'Add/Remove Space After', icon: 'vertical_align_bottom', tab: 'Home', group: 'Paragraph', edits: true, run: (app) => setParaAttrs(v(app), (a) => ({ spaceAfter: a.spaceAfter === 0 ? 8 : 0 })) },
   { id: 'para.indent', label: 'Increase Indent', icon: 'format_indent_increase', tab: 'Home', group: 'Paragraph', keys: ['Mod-m'], edits: true, popular: true, run: (app) => listIndent(v(app), 1) },
   { id: 'para.outdent', label: 'Decrease Indent', icon: 'format_indent_decrease', tab: 'Home', group: 'Paragraph', keys: ['Mod-Shift-m'], edits: true, popular: true, run: (app) => listIndent(v(app), -1) },
-  { id: 'para.hanging', label: 'Hanging Indent', icon: 'format_indent_increase', tab: 'Home', group: 'Paragraph', keys: ['Mod-t'], edits: true, run: (app) => setParaAttrs(v(app), (a) => ({ indentLeft: (a.indentLeft || 0) + 36, indentFirst: -36 })) },
-  { id: 'para.unhang', label: 'Remove Hanging Indent', icon: 'format_indent_decrease', tab: 'Home', group: 'Paragraph', keys: ['Mod-Shift-t'], edits: true, run: (app) => setParaAttrs(v(app), (a) => ({ indentLeft: Math.max(0, (a.indentLeft || 0) - 36) || null, indentFirst: null })) },
+  { id: 'para.hanging', label: 'Hanging Indent', icon: 'format_indent_increase', tab: 'Home', group: 'Paragraph', keys: webKeys(['Mod-t'], 'Alt-Shift-h'), edits: true, run: (app) => setParaAttrs(v(app), (a) => ({ indentLeft: (a.indentLeft || 0) + 36, indentFirst: -36 })) },
+  { id: 'para.unhang', label: 'Remove Hanging Indent', icon: 'format_indent_decrease', tab: 'Home', group: 'Paragraph', keys: webKeys(['Mod-Shift-t'], 'Alt-Shift-g'), edits: true, run: (app) => setParaAttrs(v(app), (a) => ({ indentLeft: Math.max(0, (a.indentLeft || 0) - 36) || null, indentFirst: null })) },
   { id: 'para.firstLine', label: 'First-Line Indent', icon: 'format_indent_increase', tab: 'Home', group: 'Paragraph', edits: true, run: (app) => setParaAttrs(v(app), (a) => ({ indentFirst: a.indentFirst > 0 ? null : 36 })), isActive: (app) => (paraAttr(app.state, 'indentFirst') || 0) > 0 },
   { id: 'para.ltr', label: 'Left-to-Right Text Direction', icon: 'format_textdirection_l_to_r', tab: 'Home', group: 'Paragraph', edits: true, run: (app) => setParaAttrs(v(app), { dir: 'ltr' }), isActive: (app) => paraAttr(app.state, 'dir') === 'ltr' },
   { id: 'para.rtl', label: 'Right-to-Left Text Direction', icon: 'format_textdirection_r_to_l', tab: 'Home', group: 'Paragraph', edits: true, run: (app) => setParaAttrs(v(app), { dir: 'rtl' }), isActive: (app) => paraAttr(app.state, 'dir') === 'rtl' },
@@ -748,7 +751,7 @@ def({
     }
   },
 });
-const styleKeys: Record<string, string[]> = { Normal: ['Mod-Shift-n'], 'Heading 1': ['Mod-Alt-1'], 'Heading 2': ['Mod-Alt-2'], 'Heading 3': ['Mod-Alt-3'], 'List Bullet': [] };
+const styleKeys: Record<string, string[]> = { Normal: webKeys(['Mod-Shift-n'], 'Alt-Shift-n'), 'Heading 1': ['Mod-Alt-1'], 'Heading 2': ['Mod-Alt-2'], 'Heading 3': ['Mod-Alt-3'], 'List Bullet': [] };
 const BUILTIN_PARA_STYLES = ['Normal', 'No Spacing', 'Title', 'Subtitle', 'Heading 1', 'Heading 2', 'Heading 3', 'Heading 4', 'Heading 5', 'Heading 6', 'Heading 7', 'Heading 8', 'Heading 9', 'Quote', 'Intense Quote', 'List Paragraph', 'Caption', 'Block Text', 'Body Text', 'Body Text First Indent', 'Plain Text', 'Code', 'Bibliography', 'Envelope Address', 'Salutation', 'Closing', 'Signature', 'Screenplay Scene', 'Screenplay Action', 'Screenplay Character', 'Screenplay Dialogue', 'Screenplay Parenthetical', 'Screenplay Transition', 'Verse', 'Epigraph', 'Hanging Indent'];
 for (const name of BUILTIN_PARA_STYLES) {
   def({

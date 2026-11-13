@@ -1,13 +1,23 @@
 // Executes every registered command against a rich sample document and reports runtime errors.
-import { chromium } from 'playwright';
+import { launchChromium } from './browser.mjs';
 import fs from 'node:fs';
 const URL = process.env.QF_URL || 'http://localhost:4173/';
-const exe = ['/opt/pw-browsers/chromium-1194/chrome-linux/chrome'].find((p) => fs.existsSync(p));
-const browser = await chromium.launch(exe ? { executablePath: exe } : {});
-const page = await browser.newPage({ viewport: { width: 1200, height: 900 } });
+const browser = await launchChromium();
+// Copy commands write to the clipboard, which headless Chromium refuses without the permission.
+const ctx = await browser.newContext({ viewport: { width: 1200, height: 900 }, permissions: ['clipboard-read', 'clipboard-write'] });
+const page = await ctx.newPage();
 const errors = [];
 page.on('pageerror', (e) => errors.push(e.message + ' @ ' + (e.stack || '').split('\n')[1]));
-page.on('console', (m) => { if (m.type() === 'error') errors.push('console: ' + m.text()); });
+// Stay offline: commands that look words up online (thesaurus, dictionary) get a network error,
+// which the app reports in the page; the browser's own "Failed to load resource" line for those is not a failure.
+const origin = new globalThis.URL(URL).origin;
+await ctx.route((u) => u.origin !== origin, (r) => r.abort('internetdisconnected'));
+page.on('console', (m) => {
+  if (m.type() !== 'error') return;
+  const at = m.location()?.url || '';
+  if (/^Failed to load resource/.test(m.text()) && at && !at.startsWith(origin)) return;
+  errors.push('console: ' + m.text() + (at ? ' @ ' + at : ''));
+});
 await page.addInitScript(() => { localStorage.setItem('quillpen.prefs.v1', JSON.stringify({ firstRun: false })); window.print = () => {}; window.open = () => null; HTMLInputElement.prototype.click = function () { if (this.type === 'file') { this.dispatchEvent(new Event('cancel')); return; } }; });
 await page.goto(URL);
 await page.waitForFunction(() => window.qf && window.qf.view);
@@ -63,3 +73,4 @@ console.log(`ran ${result.n} commands`);
 console.log('exec failures:', result.failures.length); for (const f of result.failures) console.log('  ', f);
 console.log('page errors:', errors.length); for (const e of [...new Set(errors)].slice(0, 60)) console.log('  ', e);
 await browser.close();
+process.exit(result.failures.length || errors.length ? 1 : 0);
