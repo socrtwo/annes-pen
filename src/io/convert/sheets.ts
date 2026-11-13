@@ -6,7 +6,7 @@
  * (ods/fods), Excel BIFF2-BIFF8 (xls, including Excel 5/95 and Works spreadsheets), CSV/TSV
  * (RFC 4180), dBASE (dbf) and Lotus 1-2-3 (wks/wk1, wk3/wk4 values).
  */
-import JSZip from 'jszip';
+import { loadZip } from '../zip';
 import type { Node as PMNode } from 'prosemirror-model';
 import { openCfb, le } from '../cfb';
 import { DocBuilder } from '../legacy/builder';
@@ -19,6 +19,8 @@ const u8a = (d: ArrayBuffer | Uint8Array) => (d instanceof Uint8Array ? d : new 
 /** Rows and columns imported per sheet (a table larger than this is cut, with a note). */
 export const MAX_ROWS = 5000;
 export const MAX_COLS = 64;
+/** Cells imported per sheet (rows are cut to stay within it). */
+export const MAX_CELLS = 50_000;
 
 function put(rows: Cell[][], r: number, c: number, v: Cell): void {
   if (r < 0 || c < 0 || r >= MAX_ROWS * 4 || c >= 16384) return;
@@ -88,7 +90,7 @@ const kids = (el: Element | Document, local: string) => Array.from(el.getElement
 const colIndex = (ref: string) => { let n = 0; for (const ch of ref.replace(/\d+$/, '').toUpperCase()) n = n * 26 + ch.charCodeAt(0) - 64; return n - 1; };
 
 export async function readXlsx(data: ArrayBuffer | Uint8Array): Promise<Sheet[]> {
-  const zip = await JSZip.loadAsync(data);
+  const zip = await loadZip(data);
   const text = async (p: string) => { const f = zip.file(p) || zip.file(p.replace(/^\//, '')); return f ? f.async('string') : ''; };
   const wb = xml(await text('xl/workbook.xml'));
   const date1904 = kids(wb, 'workbookPr').some((e) => /^(1|true)$/.test(e.getAttribute('date1904') || ''));
@@ -148,7 +150,7 @@ export async function readOds(data: ArrayBuffer | Uint8Array): Promise<Sheet[]> 
   const u8 = u8a(data);
   let content: string;
   if (u8[0] === 0x50 && u8[1] === 0x4b) {
-    const zip = await JSZip.loadAsync(u8);
+    const zip = await loadZip(u8);
     content = (await zip.file('content.xml')?.async('string')) || '';
   } else content = new TextDecoder().decode(u8);
   const d = xml(content);
@@ -207,6 +209,7 @@ export function readXls(data: ArrayBuffer | Uint8Array): Sheet[] {
     if (f & 1) { let s = ''; for (let i = 0; i < n && p + 1 < b.length; i++, p += 2) s += String.fromCharCode(le.u16(b, p)); return s; }
     return decodeCodepage(b.subarray(p, p + n), 1252);
   };
+  const f64 = (b: Uint8Array, p: number) => new DataView(b.buffer, b.byteOffset + p, 8).getFloat64(0, true);
   const rk = (v: number): number => {
     let n: number;
     if (v & 2) n = v >> 2;
@@ -255,10 +258,14 @@ export function readXls(data: ArrayBuffer | Uint8Array): Sheet[] {
         const parts = [d];
         while (recs[k + 1]?.op === 0x003c) parts.push(recs[++k].d);
         let pi = 0, p = 8;
-        const total = le.u32(d, 4);
+        // The count is file-supplied: every string takes at least 3 bytes, so cap it by the data.
+        let bytesLeft = -8;
+        for (const x of parts) bytesLeft += x.length;
+        const total = Math.min(le.u32(d, 4), Math.max(0, Math.floor(bytesLeft / 3)));
         const need = () => { if (p >= parts[pi].length && pi + 1 < parts.length) { pi++; p = 0; } return parts[pi]; };
         for (let i = 0; i < total && pi < parts.length; i++) {
           let b = need();
+          if (p + 3 > b.length && pi + 1 >= parts.length) break; // data exhausted
           const n = le.u16(b, p); p += 2;
           b = need();
           let f = b[p++];
@@ -286,8 +293,8 @@ export function readXls(data: ArrayBuffer | Uint8Array): Sheet[] {
       case 0x0204: if (cur) put(cur.rows, le.u16(d, 0), le.u16(d, 2), biff >= 8 ? str(d, 6, 2) : dec8(d.subarray(8, 8 + le.u16(d, 6)))); break;
       case 0x0004: if (cur) put(cur.rows, le.u16(d, 0), le.u16(d, 2), dec8(d.subarray(8, 8 + d[7]))); break;
       case 0x00d6: if (cur) put(cur.rows, le.u16(d, 0), le.u16(d, 2), biff >= 8 ? str(d, 6, 2) : dec8(d.subarray(8, 8 + le.u16(d, 6)))); break;
-      case 0x0203: num(le.u16(d, 0), le.u16(d, 2), le.u16(d, 4), new DataView(d.buffer, d.byteOffset + 6, 8).getFloat64(0, true)); break;
-      case 0x0003: num(le.u16(d, 0), le.u16(d, 2), 0, new DataView(d.buffer, d.byteOffset + 7, 8).getFloat64(0, true)); break;
+      case 0x0203: if (d.length >= 14) num(le.u16(d, 0), le.u16(d, 2), le.u16(d, 4), f64(d, 6)); break;
+      case 0x0003: if (d.length >= 15) num(le.u16(d, 0), le.u16(d, 2), 0, f64(d, 7)); break;
       case 0x0002: num(le.u16(d, 0), le.u16(d, 2), 0, le.u16(d, 7)); break;
       case 0x027e: num(le.u16(d, 0), le.u16(d, 2), le.u16(d, 4), rk(le.u32(d, 6))); break;
       case 0x00bd: {
@@ -302,7 +309,7 @@ export function readXls(data: ArrayBuffer | Uint8Array): Sheet[] {
           const kind = d[resAt];
           if (kind === 0) pendingString = { r, c };
           else if (kind === 1 && cur) put(cur.rows, r, c, !!d[resAt + 2]);
-        } else num(r, c, xf, new DataView(d.buffer, d.byteOffset + resAt, 8).getFloat64(0, true));
+        } else if (d.length >= resAt + 8) num(r, c, xf, f64(d, resAt));
         break;
       }
       case 0x0207: case 0x0007: if (pendingString && cur) { put(cur.rows, pendingString.r, pendingString.c, biff >= 8 ? str(d, 0, 2) : biff === 2 ? dec8(d.subarray(1, 1 + d[0])) : dec8(d.subarray(2, 2 + le.u16(d, 0)))); pendingString = null; } break;
@@ -319,7 +326,7 @@ export function readDbf(data: ArrayBuffer | Uint8Array): Sheet[] {
   const u8 = u8a(data);
   const n = le.u32(u8, 4), hlen = le.u16(u8, 8), rlen = le.u16(u8, 10);
   const ld = u8[29];
-  const cp = ({ 0x01: 437, 0x02: 850, 0x03: 1252, 0x57: 1252, 0x64: 852, 0x65: 866, 0x7a: 936, 0xc8: 1250, 0xc9: 1251, 0xca: 1254, 0xcb: 1253, 0x4d: 936, 0x4e: 949, 0x4f: 950, 0x7b: 932 } as Record<number, number>)[ld] || 1252;
+  const cp = ({ 0x01: 437, 0x02: 850, 0x03: 1252, 0x57: 1252, 0x64: 852, 0x65: 866, 0x6a: 737, 0x7a: 936, 0xc8: 1250, 0xc9: 1251, 0xca: 1254, 0xcb: 1253, 0x4d: 936, 0x4e: 949, 0x4f: 950, 0x7b: 932 } as Record<number, number>)[ld] || 1252;
   const fields: { name: string; type: string; len: number; dec: number }[] = [];
   for (let p = 32; p + 32 <= hlen && u8[p] !== 0x0d; p += 32) {
     let name = '';
@@ -349,6 +356,18 @@ export function readDbf(data: ArrayBuffer | Uint8Array): Sheet[] {
 // ---------------------------------------------------------------------------------------
 // Lotus 1-2-3
 
+/**
+ * WK3/WK4 "small number" cell (16-bit). Bit 0 clear: the value is the integer in bits 1-15.
+ * Bit 0 set: bits 4-15 are a signed mantissa and bits 1-3 select a scale, multiplying by
+ * 5000 or 500 or dividing by 20, 200, 2000, 20000, 16 or 64 (the encoding Gnumeric and libwps read).
+ */
+export function smallNum(v: number): number {
+  if (!(v & 1)) return v >> 1;
+  const f = [5000, 500, -20, -200, -2000, -20000, -16, -64][(v >> 1) & 7];
+  const mant = v >> 4;
+  return f > 0 ? mant * f : mant / -f;
+}
+
 export function readLotus(data: ArrayBuffer | Uint8Array): Sheet[] {
   const u8 = u8a(data);
   const sheets = new Map<number, Sheet>();
@@ -362,9 +381,11 @@ export function readLotus(data: ArrayBuffer | Uint8Array): Sheet[] {
     return exp === 0 && m === 0 ? 0 : sign * m * Math.pow(2, exp - 16383 - 63);
   };
   for (let p = 0; p + 4 <= u8.length; ) {
-    const op = le.u16(u8, p), len = le.u16(u8, p + 2);
-    const d = u8.subarray(p + 4, p + 4 + len);
-    p += 4 + len;
+    const op = le.u16(u8, p);
+    // A truncated record holds fewer bytes than it declares: test what is there.
+    const d = u8.subarray(p + 4, p + 4 + le.u16(u8, p + 2));
+    const len = d.length;
+    p += 4 + le.u16(u8, p + 2);
     if (op === 0x01) break; // EOF
     if (op === 0x0f && len >= 6) put(sheet(0).rows, le.u16(d, 3), le.u16(d, 1), label(d.subarray(5)));
     else if (op === 0x0e && len >= 13) put(sheet(0).rows, le.u16(d, 3), le.u16(d, 1), new DataView(d.buffer, d.byteOffset + 5, 8).getFloat64(0, true));
@@ -372,7 +393,7 @@ export function readLotus(data: ArrayBuffer | Uint8Array): Sheet[] {
     else if (op === 0x10 && len >= 13) put(sheet(0).rows, le.u16(d, 3), le.u16(d, 1), new DataView(d.buffer, d.byteOffset + 5, 8).getFloat64(0, true));
     else if (op === 0x16 && len >= 5) put(sheet(d[2]).rows, le.u16(d, 0), d[3], label(d.subarray(4)));
     else if (op === 0x17 && len >= 14) put(sheet(d[2]).rows, le.u16(d, 0), d[3], f80(d, 4));
-    else if (op === 0x18 && len >= 6) { const v = le.i16(d, 4); put(sheet(d[2]).rows, le.u16(d, 0), d[3], v & 1 ? v >> 1 : v >> 1); }
+    else if (op === 0x18 && len >= 6) put(sheet(d[2]).rows, le.u16(d, 0), d[3], smallNum(le.i16(d, 4)));
     else if (op === 0x19 && len >= 14) put(sheet(d[2]).rows, le.u16(d, 0), d[3], f80(d, 4));
     if (sheets.size > 256) break;
   }
@@ -387,23 +408,39 @@ export function sheetsToDoc(sheets: Sheet[], title: string): PMNode {
   b.property('title', title);
   let first = true;
   for (const s of sheets) {
-    // Used range: drop empty trailing rows/columns.
-    let rows = s.rows.map((r) => (r ? [...r] : []));
-    while (rows.length && !rows[rows.length - 1].some((v) => v != null && v !== '')) rows.pop();
-    const lead = rows.findIndex((r) => r.some((v) => v != null && v !== ''));
-    if (lead > 0) rows = rows.slice(lead);
-    const width = Math.min(MAX_COLS, Math.max(0, ...rows.map((r) => { let n = r.length; while (n && (r[n - 1] == null || r[n - 1] === '')) n--; return n; })));
+    // Used range: drop empty leading/trailing rows and trailing columns. Rows are read in place
+    // (never copied), since a sparse row can be very long.
+    const filled = (v: Cell | undefined) => v != null && v !== '';
+    const used = (r: Cell[] | undefined) => !!r && r.some(filled);
+    let first0 = 0, end = s.rows.length;
+    while (end > 0 && !used(s.rows[end - 1])) end--;
+    while (first0 < end && !used(s.rows[first0])) first0++;
+    let rowIdx: number[] = [];
+    for (let r = first0; r < end; r++) rowIdx.push(r);
+    const cols = new Set<number>();
+    for (const r of rowIdx) s.rows[r]?.forEach((v, c) => { if (filled(v)) cols.add(c); });
+    const widest = cols.size ? Math.max(...cols) + 1 : 0;
+    let colIdx: number[] = [];
+    for (let c = 0; c < widest; c++) colIdx.push(c);
+    // A sparse sheet whose used range is huge: keep only the rows and columns that hold values.
+    if (rowIdx.length * Math.min(MAX_COLS, colIdx.length) > MAX_CELLS) {
+      rowIdx = rowIdx.filter((r) => used(s.rows[r]));
+      colIdx = [...cols].sort((a, b) => a - b);
+    }
+    const width = Math.min(MAX_COLS, colIdx.length);
     if (!first) b.pageBreak();
     first = false;
     if (sheets.length > 1 || s.name) { b.text(s.name || 'Sheet'); b.endParagraph({ style: 'Heading 2' }); }
-    if (!rows.length || !width) { b.text('(empty sheet)', { italic: true }); b.endParagraph(); continue; }
-    const shown = rows.slice(0, MAX_ROWS);
+    if (!rowIdx.length || !width) { b.text('(empty sheet)', { italic: true }); b.endParagraph(); continue; }
+    const maxRows = Math.max(1, Math.min(MAX_ROWS, Math.floor(MAX_CELLS / width)));
+    const shown = rowIdx.slice(0, maxRows);
     b.startTable({ headerRows: 0 });
-    for (const r of shown) {
+    for (const ri of shown) {
+      const r = s.rows[ri] || [];
       b.startRow();
-      for (let c = 0; c < width; c++) {
+      for (let k = 0; k < width; k++) {
         b.startCell();
-        const v = r[c] ?? null;
+        const v = r[colIdx[k]] ?? null;
         const t = cellText(v);
         if (t) b.text(t);
         b.endParagraph({ align: typeof v === 'number' ? 'right' : null });
@@ -412,7 +449,7 @@ export function sheetsToDoc(sheets: Sheet[], title: string): PMNode {
       b.endRow();
     }
     b.endTable();
-    const cut = [rows.length > MAX_ROWS ? `the first ${MAX_ROWS.toLocaleString()} of ${rows.length.toLocaleString()} rows` : '', Math.max(...rows.map((r) => r.length)) > MAX_COLS ? `the first ${MAX_COLS} columns` : ''].filter(Boolean);
+    const cut = [rowIdx.length > maxRows ? `the first ${maxRows.toLocaleString()} of ${rowIdx.length.toLocaleString()} rows` : '', colIdx.length > MAX_COLS ? `the first ${MAX_COLS} columns` : ''].filter(Boolean);
     if (cut.length) { b.text(`Only ${cut.join(' and ')} were imported.`, { italic: true }); b.endParagraph(); }
   }
   if (!sheets.length) { b.text('The workbook has no sheets with values.', { italic: true }); b.endParagraph(); }

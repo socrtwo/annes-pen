@@ -13,7 +13,7 @@
  */
 import type { Node as PMNode } from 'prosemirror-model';
 import { openCfb, le, type Cfb } from '../cfb';
-import { immortalInflate } from '../recover/inflate';
+import { immortalInflate, inflateLimit } from '../recover/inflate';
 import { DocBuilder, hex, type CharProps, type ParaProps } from './builder';
 
 const u8a = (d: ArrayBuffer | Uint8Array) => (d instanceof Uint8Array ? d : new Uint8Array(d));
@@ -69,7 +69,7 @@ class HwpReader {
     const raw = this.cfb.read(path);
     if (!raw) return null;
     if (!this.compressed) return raw;
-    try { return immortalInflate(raw).data; } catch { return null; }
+    try { return immortalInflate(raw, { maxOutput: inflateLimit(raw.length) }).data; } catch { return null; }
   }
 
   readDocInfo(): void {

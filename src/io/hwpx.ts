@@ -16,7 +16,7 @@
  * Not mapped: drawing objects other than pictures, text art, equations (kept as their script
  * text), memo (comment) shapes, change tracking.
  */
-import JSZip from 'jszip';
+import { loadZip } from './zip';
 import type { Mark, Node as PMNode } from 'prosemirror-model';
 import { schema } from '../editor/schema';
 import { PAGE_SIZES, type StyleDef } from '../editor/settings';
@@ -332,7 +332,7 @@ class HwpxReader {
 
 export async function importHwpx(data: ArrayBuffer, name: string): Promise<PMNode> {
   void name;
-  const zip = await JSZip.loadAsync(data);
+  const zip = await loadZip(data);
   const files = new Map<string, Uint8Array>();
   const tasks: Promise<void>[] = [];
   zip.forEach((p, f) => { if (!f.dir) tasks.push(f.async('uint8array').then((b) => { files.set(p, b); })); });

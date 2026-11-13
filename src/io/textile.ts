@@ -51,7 +51,7 @@ class TextileReader {
       { re: /"([^"\n]+?)(?:\(([^)]*)\))?":((?:https?|ftp|mailto|file):[^\s<>"]+[^\s<>".,;:!?)]|[^\s<>"]+[^\s<>".,;:!?)])/, run: (m) => ({ mark: linkMark(m[3]), inner: m[1] }) },
       { re: /\[\^([^^\n]+)\^\]/, run: (m) => ({ mark: MK.sup.create(), inner: m[1] }) },
       { re: /\[~([^~\n]+)~\]/, run: (m) => ({ mark: MK.sub.create(), inner: m[1] }) },
-      { re: /\[(\d+)\]/, run: (m) => (this.notes.has(m[1]) ? [S.footnote.create({ text: this.plain(this.notes.get(m[1])!) })] : m[0]) },
+      { re: /\[(\d+)\]/, run: (m) => (this.notes.has(m[1]) && !this.noteBusy.has(m[1]) ? [S.footnote.create({ text: this.noteText(m[1]) })] : m[0]) },
       { re: /!(\{[^}]*\}|<|>|=)*([^\s!(]+)(?:\(([^)]*)\))?!(?::(\S+))?/, run: (m) => [S.image.create({ src: m[2], alt: m[3] || '', link: m[4] || null })] },
       { re: /@([^@\n]+)@/, run: (m) => ({ mark: MK.code.create(), inner: m[1] }) },
       span('\\*\\*', () => MK.bold.create()),
@@ -78,6 +78,18 @@ class TextileReader {
   }
 
   private plain(t: string): string { return this.inline(t).map((n) => n.textContent).join(''); }
+
+  /** A footnote's text; a note citing itself (directly or via others) stays a literal "[n]". */
+  private noteBusy = new Set<string>();
+  private noteCache = new Map<string, string>();
+  private noteText(id: string): string {
+    let t = this.noteCache.get(id);
+    if (t != null) return t;
+    this.noteBusy.add(id);
+    try { t = this.plain(this.notes.get(id)!); } finally { this.noteBusy.delete(id); }
+    this.noteCache.set(id, t);
+    return t;
+  }
 
   inline(t: string, marks: readonly Mark[] = []): PMNode[] {
     return parseInline(t.replace(/\n/g, ' '), this.rules, marks);
@@ -131,6 +143,7 @@ class TextileReader {
       }
       // Tables.
       if (/^(table(\S*)\.\s*$|\|)/.test(l)) {
+        const start = i;
         if (/^table/.test(l)) i++;
         const rows: CellSpec[][] = [];
         let headerRows = 0;
@@ -150,9 +163,12 @@ class TextileReader {
           rows.push(spec);
           i++;
         }
-        const t = makeTable(rows, { headerRows });
-        if (t) out.push(t);
-        continue;
+        if (i > start) {
+          const t = makeTable(rows, { headerRows });
+          if (t) out.push(t);
+          continue;
+        }
+        // A "|" line that isn't a table row: read it as a paragraph.
       }
       // Raw HTML: list/table/pre blocks go through the HTML importer; lone wrapper tags are dropped.
       if (/^\s*<(\/?)[a-zA-Z]/.test(l)) {

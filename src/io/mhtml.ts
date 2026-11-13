@@ -22,7 +22,14 @@ const fromLatin1 = (s: string) => { const u = new Uint8Array(s.length); for (let
 export function parseContentType(v: string | undefined): { type: string; params: Record<string, string> } {
   const params: Record<string, string> = {};
   if (!v) return { type: 'text/plain', params };
-  const parts = v.split(/;(?=(?:[^"]*"[^"]*")*[^"]*$)/);
+  // Split on semicolons outside quotes (a linear scan; absurdly long headers are cut).
+  const parts: string[] = [];
+  let cur = '', quoted = false;
+  for (const c of v.slice(0, 65536)) {
+    if (c === '"') quoted = !quoted;
+    if (c === ';' && !quoted) { parts.push(cur); cur = ''; } else cur += c;
+  }
+  parts.push(cur);
   const type = parts.shift()!.trim().toLowerCase();
   for (const p of parts) {
     const i = p.indexOf('=');
@@ -43,7 +50,7 @@ function decodeWords(v: string): string {
 }
 
 function decodeQP(s: string): Uint8Array {
-  const t = s.replace(/=\r?\n/g, '');
+  const t = s.replace(/=[ \t]*\r?\n/g, '');
   const out: number[] = [];
   for (let i = 0; i < t.length; i++) {
     const c = t[i];
@@ -54,7 +61,7 @@ function decodeQP(s: string): Uint8Array {
 }
 
 /** Parse a MIME entity (headers + body) from latin-1 text; multiparts are flattened into leaf parts. */
-export function parseMime(raw: string, out: MimePart[] = []): MimePart[] {
+export function parseMime(raw: string, out: MimePart[] = [], depth = 0): MimePart[] {
   const split = /\r?\n\r?\n/.exec(raw);
   const headText = split ? raw.slice(0, split.index) : raw;
   const bodyText = split ? raw.slice(split.index + split[0].length) : '';
@@ -65,12 +72,13 @@ export function parseMime(raw: string, out: MimePart[] = []): MimePart[] {
   }
   const { type, params } = parseContentType(headers.get('content-type'));
   if (type.startsWith('multipart/') && params.boundary) {
+    if (depth > 12) return out;
     const b = '--' + params.boundary;
     const chunks = bodyText.split(new RegExp(`(?:^|\\r?\\n)${b.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:--)?[ \\t]*(?=\\r?\\n|$)`));
     for (const ch of chunks.slice(1)) {
       const c = ch.replace(/^\r?\n/, '');
       if (!c.trim() || c.trim() === '--') continue;
-      parseMime(c, out);
+      parseMime(c, out, depth + 1);
     }
     if (out.length && params.start) (out as any).start = params.start;
     return out;
@@ -132,7 +140,8 @@ export function mhtmlToHtml(data: ArrayBuffer | Uint8Array): string {
     const r = ref.trim().replace(/&amp;/g, '&');
     if (byRef.has(r)) return byRef.get(r);
     try { if (rootLoc) { const abs = new URL(r, rootLoc).href; if (byRef.has(abs)) return byRef.get(abs); } } catch { /* ignore */ }
-    return byRef.get(decodeURIComponent(r.split('/').pop() || r));
+    const last = r.split('/').pop() || r;
+    try { return byRef.get(decodeURIComponent(last)); } catch { return byRef.get(last); }
   };
   const resolveCss = (css: string) => css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (m, q, ref) => { const p = lookup(ref); return p ? `url(${q}${asData(p)}${q})` : m; });
   let html = decodeText(root);

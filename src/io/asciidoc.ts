@@ -46,7 +46,7 @@ class AdocReader {
       { re: /link:([^\s[]+)\[([^\]]*)\]/, run: (m) => ({ mark: linkMark(m[1]), inner: (m[2] || m[1]).replace(/\^$/, '').replace(/,\s*window=.*$/, '').replace(/^"|"$/g, '') }) },
       { re: /mailto:([^\s[]+)\[([^\]]*)\]/, run: (m) => ({ mark: linkMark('mailto:' + m[1]), inner: m[2] || m[1] }) },
       { re: /((?:https?|ftp|irc|file):\/\/[^\s[<>]+)\[([^\]]*)\]/, run: (m) => ({ mark: linkMark(m[1]), inner: (m[2] || m[1]).replace(/\^$/, '').replace(/,\s*window=.*$/, '').replace(/^"|"$/g, '') }) },
-      { re: /<?((?:https?|ftp):\/\/[^\s<>[\]]+[^\s<>[\].,;:!?)])>?/, notAfter: /[\w/:]/, run: (m) => ({ mark: linkMark(m[1]), inner: m[1] }) },
+      { re: /<?((?:https?|ftp):\/\/[^\s<>[\]]+[^\s<>[\].,;:!?)])>?/, notAfter: /[\w/:]/, run: (m) => ({ mark: linkMark(m[1]), inner: m[1], raw: true }) },
       { re: /<<([\w:.-]+)(?:,\s*([^>]+))?>>/, run: (m) => ({ mark: linkMark('#' + m[1]), inner: m[2] || m[1] }) },
       { re: /xref:([\w:.#-]+)\[([^\]]*)\]/, run: (m) => ({ mark: linkMark('#' + m[1]), inner: m[2] || m[1] }) },
       { re: /\[\.(underline|line-through|big|small|[\w-]+)\]#([^#\n]+)#/, run: (m) => ({ mark: m[1] === 'underline' ? MK.underline.create() : m[1] === 'line-through' ? MK.strike.create() : m[1] === 'big' ? MK.size.create({ pt: 14 }) : m[1] === 'small' ? MK.size.create({ pt: 9 }) : null, inner: m[2] }) },

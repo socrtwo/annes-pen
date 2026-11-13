@@ -17,7 +17,7 @@
  * setup of IWA documents are not mapped. Password-protected packages cannot be decrypted; the
  * importer then shows the package's preview image and says so.
  */
-import JSZip from 'jszip';
+import { loadZip } from './zip';
 import type { Mark, Node as PMNode } from 'prosemirror-model';
 import { schema } from '../editor/schema';
 import { PAGE_SIZES, type StyleDef } from '../editor/settings';
@@ -312,7 +312,7 @@ class Pages09Reader {
     for (const ref of refs) {
       const st = this.style(ref);
       let named = st;
-      while (named && !attr(named, 'name')) named = this.style(attr(named, 'parent-ident'));
+      for (let d = 0; named && !attr(named, 'name'); d++) named = d < 20 ? this.style(attr(named, 'parent-ident')) : null;
       const n = styleNameMap(this.name(st));
       if (!named || !n || this.settings.styles[n]) continue;
       const c = this.charProps(named);
@@ -673,14 +673,14 @@ export async function importPages(data: ArrayBuffer, name: string): Promise<PMNo
   const u8 = new Uint8Array(data);
   const files: Files = new Map();
   if (u8[0] === 0x50 && u8[1] === 0x4b) {
-    const zip = await JSZip.loadAsync(data);
+    const zip = await loadZip(data);
     const tasks: Promise<void>[] = [];
     zip.forEach((p, f) => { if (!f.dir) tasks.push(f.async('uint8array').then((b) => { files.set(p.replace(/^[^/]+\.pages\//, ''), b); })); });
     await Promise.all(tasks);
     // Pages 5.0–5.2 kept the IWA files in a nested Index.zip.
     const nested = files.get('Index.zip');
     if (nested) {
-      const inner = await JSZip.loadAsync(nested);
+      const inner = await loadZip(nested);
       const t2: Promise<void>[] = [];
       inner.forEach((p, f) => { if (!f.dir) t2.push(f.async('uint8array').then((b) => { files.set(p.startsWith('Index/') ? p : 'Index/' + p, b); })); });
       await Promise.all(t2);

@@ -7,6 +7,7 @@
  * binary format (ppt; text only, from the slide list's text atoms).
  */
 import JSZip from 'jszip';
+import { loadZip } from '../zip';
 import type { Node as PMNode } from 'prosemirror-model';
 import { openCfb, le } from '../cfb';
 import { DocBuilder, type CharProps } from '../legacy/builder';
@@ -71,7 +72,7 @@ function drawingParas(body: Element): SlideText[] {
 }
 
 export async function readPptx(data: ArrayBuffer | Uint8Array): Promise<Slide[]> {
-  const zip = await JSZip.loadAsync(data);
+  const zip = await loadZip(data);
   const pres = 'ppt/presentation.xml';
   const pr = await rels(zip, pres);
   const doc = xml((await zip.file(pres)?.async('string')) || '<p/>');
@@ -125,7 +126,7 @@ export async function readPptx(data: ArrayBuffer | Uint8Array): Promise<Slide[]>
 export async function readOdp(data: ArrayBuffer | Uint8Array): Promise<Slide[]> {
   const u8 = u8a(data);
   let content: string, zip: JSZip | null = null;
-  if (u8[0] === 0x50 && u8[1] === 0x4b) { zip = await JSZip.loadAsync(u8); content = (await zip.file('content.xml')?.async('string')) || ''; }
+  if (u8[0] === 0x50 && u8[1] === 0x4b) { zip = await loadZip(u8); content = (await zip.file('content.xml')?.async('string')) || ''; }
   else content = new TextDecoder().decode(u8);
   const d = xml(content);
   const P = 'urn:oasis:names:tc:opendocument:xmlns:presentation:1.0', X = 'http://www.w3.org/1999/xlink', SVG = 'urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0';
@@ -178,12 +179,14 @@ export function readPpt(data: ArrayBuffer | Uint8Array): Slide[] {
     if ((verInst & 0xf) === 0xf) { p = start; continue; }
     if (inList && p >= listEnd) inList = false;
     if (inList && type === 0x03f3) { cur = { title: '', body: [], tables: [], images: [], notes: '' }; slides.push(cur); }
-    else if (inList && type === 0x0f9f) kind = le.u32(s, start);
+    else if (inList && type === 0x0f9f) { if (start + 4 <= s.length) kind = le.u32(s, start); }
     else if (inList && cur && (type === 0x0fa0 || type === 0x0fa8)) {
-      let t = '';
-      if (type === 0x0fa0) for (let i = start; i + 1 < start + len; i += 2) t += String.fromCharCode(le.u16(s, i));
-      else for (let i = start; i < start + len; i++) t += String.fromCharCode(s[i]);
-      t = t.replace(/\r/g, '\n').replace(/\x0b/g, '\n');
+      // The atom length is file-supplied: never read past the stream.
+      const end = Math.min(s.length, start + len);
+      const cs: string[] = [];
+      if (type === 0x0fa0) for (let i = start; i + 1 < end; i += 2) cs.push(String.fromCharCode(le.u16(s, i)));
+      else for (let i = start; i < end; i++) cs.push(String.fromCharCode(s[i]));
+      const t = cs.join('').replace(/\r/g, '\n').replace(/\x0b/g, '\n');
       if ((kind === 0 || kind === 6) && !cur.title) cur.title = t.trim();
       else for (const line of t.split('\n')) cur.body.push({ level: 0, bullet: kind === 1 || kind === 5 || kind === 7, runs: [{ text: line, cp: {} }] });
     }

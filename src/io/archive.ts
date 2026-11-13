@@ -3,12 +3,20 @@
  * KOffice 1.0–1.2 .kwd, Pages '09 index.xml.gz). Synchronous, dependency-free, never throws
  * on damaged input (returns what could be decoded).
  */
-import { immortalInflate } from './recover/inflate';
+import { crc32, immortalInflate, inflateLimit } from './recover/inflate';
 
-/** Decompress a gzip stream (RFC 1952); concatenated members are joined. */
-export function gunzip(u8: Uint8Array): Uint8Array {
+export interface GunzipResult {
+  data: Uint8Array;
+  /** Problems found: a member that didn't inflate cleanly, or a CRC32/size trailer mismatch. */
+  damage: string[];
+}
+
+/** Decompress a gzip stream (RFC 1952), checking each member's trailer; concatenated members are joined. */
+export function gunzipChecked(u8: Uint8Array): GunzipResult {
   const parts: Uint8Array[] = [];
-  let p = 0;
+  const damage: string[] = [];
+  let p = 0, total = 0;
+  const max = inflateLimit(u8.length);
   while (p + 18 <= u8.length && u8[p] === 0x1f && u8[p + 1] === 0x8b && u8[p + 2] === 8) {
     const flags = u8[p + 3];
     let i = p + 10;
@@ -16,13 +24,29 @@ export function gunzip(u8: Uint8Array): Uint8Array {
     if (flags & 8) { while (i < u8.length && u8[i]) i++; i++; } // FNAME
     if (flags & 16) { while (i < u8.length && u8[i]) i++; i++; } // FCOMMENT
     if (flags & 2) i += 2; // FHCRC
-    const r = immortalInflate(u8.subarray(i));
+    if (i >= u8.length) break;
+    const r = immortalInflate(u8.subarray(i), { maxOutput: Math.max(1, max - total) });
     parts.push(r.data);
-    // The member's end is not known without tracking the bit position; one member is the norm.
-    break;
+    total += r.data.length;
+    const m = parts.length;
+    if (r.isCorrupt) { damage.push(`gzip member ${m} is damaged`); break; }
+    const t = i + (r.consumed ?? 0);
+    if (t + 8 > u8.length) { damage.push(`gzip member ${m} has no trailer`); break; }
+    const crc = (u8[t] | (u8[t + 1] << 8) | (u8[t + 2] << 16) | (u8[t + 3] << 24)) >>> 0;
+    const size = (u8[t + 4] | (u8[t + 5] << 8) | (u8[t + 6] << 16) | (u8[t + 7] << 24)) >>> 0;
+    if (crc !== crc32(r.data) || size !== (r.data.length >>> 0)) damage.push(`gzip member ${m} fails its CRC check`);
+    p = t + 8;
   }
-  if (!parts.length) return new Uint8Array(0);
-  return parts[0];
+  if (parts.length <= 1) return { data: parts[0] ?? new Uint8Array(0), damage };
+  const out = new Uint8Array(total);
+  let w = 0;
+  for (const x of parts) { out.set(x, w); w += x.length; }
+  return { data: out, damage };
+}
+
+/** Decompress a gzip stream; damaged data yields what could be decoded. */
+export function gunzip(u8: Uint8Array): Uint8Array {
+  return gunzipChecked(u8).data;
 }
 
 export interface TarEntry { name: string; data: Uint8Array }

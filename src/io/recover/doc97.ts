@@ -32,7 +32,9 @@ export function readCfb(b: Uint8Array): CfbStreams | null {
   let shift = u16(0x1e);
   if (shift !== 9 && shift !== 12) shift = 9;
   const secSize = 1 << shift;
-  const miniSize = 1 << (u16(0x20) || 6);
+  let miniShift = u16(0x20);
+  if (miniShift < 2 || miniShift > 12) miniShift = 6;
+  const miniSize = 1 << miniShift;
   const dirStart = u32(0x30);
   const miniCutoff = u32(0x38) || 4096;
   const miniFatStart = u32(0x3c);
@@ -42,19 +44,23 @@ export function readCfb(b: Uint8Array): CfbStreams | null {
   const maxSid = Math.ceil(b.length / secSize);
 
   // FAT sector list from the header DIFAT and any DIFAT chain.
+  // No more FAT sectors than it takes to map the file; a sector listed twice is read once.
+  const perSec = secSize / 4;
+  const maxFat = Math.ceil(maxSid / perSec);
   const fatSids: number[] = [];
-  for (let k = 0; k < 109; k++) { const s = u32(0x4c + k * 4); if (s < maxSid) fatSids.push(s); }
+  const listed = new Set<number>();
+  const addFat = (s: number) => { if (s < maxSid && fatSids.length < maxFat) { fatSids.push(listed.has(s) ? 0xffffffff : s); listed.add(s); } };
+  for (let k = 0; k < 109; k++) addFat(u32(0x4c + k * 4));
   const seenDifat = new Set<number>();
-  for (let d = difatStart; d < maxSid && !seenDifat.has(d); ) {
+  for (let d = difatStart; d < maxSid && !seenDifat.has(d) && fatSids.length < maxFat; ) {
     seenDifat.add(d);
     const off = secOff(d);
     const per = secSize / 4 - 1;
-    for (let k = 0; k < per; k++) { const s = u32(off + k * 4); if (s < maxSid) fatSids.push(s); }
+    for (let k = 0; k < per; k++) addFat(u32(off + k * 4));
     d = u32(off + per * 4);
   }
-  const perSec = secSize / 4;
   const fat = new Uint32Array(fatSids.length * perSec).fill(END);
-  fatSids.forEach((sid, n) => { const off = secOff(sid); for (let k = 0; k < perSec; k++) fat[n * perSec + k] = u32(off + k * 4); });
+  fatSids.forEach((sid, n) => { if (sid === 0xffffffff) return; const off = secOff(sid); for (let k = 0; k < perSec; k++) fat[n * perSec + k] = u32(off + k * 4); });
 
   /** Follow a sector chain. A chain that ends on anything but ENDOFCHAIN is reported as broken. */
   const chain = (start: number, table: Uint32Array, limit: number, label: string): { sids: number[]; broken: boolean } => {

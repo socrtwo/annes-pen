@@ -55,7 +55,7 @@ class RstReader {
     const ws = /[\w]/;
     return [
       { re: /\\(.)/, run: (m) => (/\s/.test(m[1]) ? '' : m[1]) },
-      { re: /``([^`]+?)``/, notAfter: ws, run: (m) => ({ mark: MK.code.create(), inner: m[1].replace(/\\/g, '\\\\') }) },
+      { re: /``([^`]+?)``/, notAfter: ws, run: (m) => ({ mark: MK.code.create(), inner: m[1], raw: true }) },
       { re: /:(sub|subscript):`([^`]+)`/, run: (m) => ({ mark: MK.sub.create(), inner: m[2] }) },
       { re: /:(sup|superscript):`([^`]+)`/, run: (m) => ({ mark: MK.sup.create(), inner: m[2] }) },
       { re: /:math:`([^`]+)`/, run: (m) => [S.math_inline.create({ latex: m[1] })] },
@@ -70,14 +70,25 @@ class RstReader {
       { re: /\*(\S(?:[^*]*?\S)?)\*/, notAfter: ws, run: (m) => ({ mark: MK.italic.create(), inner: m[1] }) },
       { re: /`([^`]+)`/, notAfter: ws, run: (m) => ({ mark: MK.italic.create(), inner: m[1] }) },
       { re: /\|([^|\s][^|]*)\|(_{0,2})/, run: (m) => this.substitutions.get(m[1]) ?? m[0] },
-      { re: /(https?:\/\/[^\s<>`]+[^\s<>`.,;:!?)\]])/, notAfter: /[\w/]/, run: (m) => ({ mark: linkMark(m[1]), inner: m[1] }) },
+      { re: /(https?:\/\/[^\s<>`]+[^\s<>`.,;:!?)\]])/, notAfter: /[\w/]/, run: (m) => ({ mark: linkMark(m[1]), inner: m[1], raw: true }) },
       { re: /([A-Za-z0-9][\w-]*)_(?![\w])/, notAfter: ws, run: (m) => { const t = this.targets.get(m[1].toLowerCase()); return t ? { mark: linkMark(t), inner: m[1] } : m[1]; } },
     ];
   }
 
+  private noteBusy = new Set<string>();
+  private noteCache = new Map<string, string>();
   private noteText(label: string): string {
-    const raw = label === '#' || label === '*' ? this.autoFootnotes[this.autoUsed++] || '' : this.footnotes.get(label) ?? '';
-    return this.inline(raw).map((x) => x.textContent).join('');
+    const auto = label === '#' || label === '*';
+    // A footnote citing itself (directly or via others) is not expanded again.
+    if (!auto && this.noteBusy.has(label)) return '';
+    const cached = auto ? null : this.noteCache.get(label);
+    if (cached != null) return cached;
+    const raw = auto ? this.autoFootnotes[this.autoUsed++] || '' : this.footnotes.get(label) ?? '';
+    if (!auto) this.noteBusy.add(label);
+    let t: string;
+    try { t = this.inline(raw).map((x) => x.textContent).join(''); } finally { if (!auto) this.noteBusy.delete(label); }
+    if (!auto) this.noteCache.set(label, t);
+    return t;
   }
 
   inline(t: string, marks: readonly Mark[] = []): PMNode[] {
