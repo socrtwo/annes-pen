@@ -94,10 +94,11 @@ export function compareDocs(original: PMNode, revised: PMNode, author: string): 
 }
 
 /** Block-level objects (rules, breaks, equations, generated blocks) record the change as an attribute. */
+const changeOf = (mark: Mark) => ({ kind: mark.type === schema.marks.deletion ? 'deletion' : 'insertion', author: mark.attrs.author, date: mark.attrs.date, id: mark.attrs.id });
+
 function markLeaf(node: PMNode, mark: Mark): PMNode {
   if (!node.type.spec.attrs?.change || node.isInline) return node;
-  const kind = mark.type === schema.marks.deletion ? 'deletion' : 'insertion';
-  return node.type.create({ ...node.attrs, change: { kind, author: mark.attrs.author, date: mark.attrs.date, id: mark.attrs.id } }, node.content, node.marks);
+  return node.type.create({ ...node.attrs, change: changeOf(mark) }, node.content, node.marks);
 }
 
 function markText(node: PMNode, mark: Mark): PMNode {
@@ -110,7 +111,8 @@ function markText(node: PMNode, mark: Mark): PMNode {
   if (node.isTextblock) {
     const kids: PMNode[] = [];
     node.forEach((c) => kids.push(c.mark(mark.addToSet(c.marks))));
-    return node.type.create(node.attrs, kids, node.marks);
+    // The paragraph mark is part of the change too, so Accept/Reject remove the whole paragraph.
+    return node.type.create(node.type.spec.attrs?.change ? { ...node.attrs, change: changeOf(mark) } : node.attrs, kids, node.marks);
   }
   if (node.isLeaf) return markLeaf(node, mark);
   const kids: PMNode[] = [];

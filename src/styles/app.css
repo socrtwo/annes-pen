@@ -364,6 +364,12 @@ textarea { width: 100%; resize: vertical; font-family: ui-monospace, "Cousine", 
 [data-markup="none"] .qf-doc .ProseMirror ins.qf-ins { color: inherit; text-decoration: none; }
 [data-markup="none"] .qf-doc .ProseMirror del.qf-del { display: none; }
 [data-markup="original"] .qf-doc .ProseMirror ins.qf-ins { display: none; }
+/* Tracked paragraph marks (inserted or deleted paragraph breaks). */
+.qf-doc .ProseMirror .qf-pmark-ins::after { content: "\00b6"; color: #1a56b5; }
+.qf-doc .ProseMirror .qf-pmark-del::after { content: "\00b6"; color: #b3261e; text-decoration: line-through; }
+[data-markup="simple"] .qf-doc .ProseMirror .qf-pmark-ins::after, [data-markup="simple"] .qf-doc .ProseMirror .qf-pmark-del::after,
+[data-markup="none"] .qf-doc .ProseMirror .qf-pmark-ins::after, [data-markup="none"] .qf-doc .ProseMirror .qf-pmark-del::after,
+[data-markup="original"] .qf-doc .ProseMirror .qf-pmark-ins::after, [data-markup="original"] .qf-doc .ProseMirror .qf-pmark-del::after { content: none; }
 [data-markup="original"] .qf-doc .ProseMirror del.qf-del { color: inherit; text-decoration: none; }
 .qf-hideInsertions .qf-doc .ProseMirror ins.qf-ins { color: inherit; text-decoration: none; }
 .qf-hideInsertions .qf-doc .ProseMirror del.qf-del { display: none; }

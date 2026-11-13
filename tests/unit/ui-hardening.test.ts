@@ -22,6 +22,7 @@ import { keyName } from '../../src/editor/setup';
 import { replaceAll } from '../../src/commands/edit';
 import { saveTab, docKey, localKey } from '../../src/commands/file';
 import { combineTr, sha } from '../../src/commands/review';
+import { verifyPassword } from '../../src/util/crypto';
 import { sanitizePrefs, loadPrefs, defaultPrefs } from '../../src/prefs';
 import * as dialog from '../../src/ui/dialog';
 import * as native from '../../src/platform/native';
@@ -170,7 +171,7 @@ describe('restrict editing', () => {
     expect(app.settings.protection.hash).toBe(await sha('secret'));
     promptDialog.mockResolvedValue('secret');
     await run(app, 'review.restrictEditing');
-    expect(app.settings.protection.hash).toBe(await sha('mine'));
+    expect(await verifyPassword('mine', app.settings.protection.hash)).toBe(true);
   });
 });
 
