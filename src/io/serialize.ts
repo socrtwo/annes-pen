@@ -9,7 +9,7 @@
  * - schema repair: turn loosely-built node trees into a valid `doc`
  * - nested-list builder used by importers that only know "paragraph at level n"
  */
-import { stripInvalidXml } from './ooxml-util';
+import { escapeXmlText, stripInvalidXml } from './ooxml-util';
 import { decodeAuto } from './encoding';
 import { sanitizeGeneratedHtml } from '../util/sanitize';
 import { DOMSerializer, Fragment, Mark, type Node as PMNode, type NodeType, type DOMOutputSpec } from 'prosemirror-model';
@@ -198,13 +198,10 @@ export function baseName(name: string): string {
 // ---------------------------------------------------------------------------------------------
 // Escaping
 
-// eslint-disable-next-line no-control-regex
-const XML_INVALID = /[\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]/g;
-
 /** Escape text for XML/HTML text and attribute content (also removes characters illegal in XML 1.0). */
 export function escapeXml(s: string | null | undefined): string {
   if (s == null) return '';
-  return String(s).replace(XML_INVALID, '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  return escapeXmlText(String(s), '&#39;');
 }
 export const escapeHtml = escapeXml;
 
@@ -587,6 +584,8 @@ export function renderHtml(content: Fragment, notes: NoteInfo[], opts: RenderOpt
     parent.removeChild(el);
   });
   container.normalize();
+  // An empty paragraph has no height in HTML: a line break gives it its line (the importer drops it again).
+  container.querySelectorAll('p, h1, h2, h3, h4, h5, h6').forEach((el) => { if (!el.firstChild) el.appendChild(tdoc.createElement('br')); });
   container.querySelectorAll('*').forEach((el) => {
     el.removeAttribute('contenteditable');
     el.removeAttribute('draggable');
@@ -649,7 +648,8 @@ export function baseCss(settings: DocSettings, forEpub = false): string {
 @media (max-width:${Math.round(w * 1.333)}px){.qf-doc{padding:24px 16px}}
 @media print{html{background:none}body{padding:0}.qf-doc{box-shadow:none;padding:0;max-width:none}}`,
     '.qf-doc .ProseMirror{overflow-wrap:break-word;white-space:normal}',
-    '.qf-doc p,.qf-doc h1,.qf-doc h2,.qf-doc h3,.qf-doc h4,.qf-doc h5,.qf-doc h6{margin:0}',
+    // Text keeps its tabs, runs of spaces and leading spaces, as in the editor.
+    '.qf-doc p,.qf-doc h1,.qf-doc h2,.qf-doc h3,.qf-doc h4,.qf-doc h5,.qf-doc h6{margin:0;white-space:pre-wrap}',
     '.qf-doc img{max-width:100%;height:auto;vertical-align:baseline}',
     '.qf-doc img[data-wrap=left]{float:left;margin:0 12pt 6pt 0}.qf-doc img[data-wrap=right]{float:right;margin:0 0 6pt 12pt}.qf-doc img[data-wrap=center]{display:block;margin:6pt auto}',
     '.qf-doc table{border-collapse:collapse;margin:6pt 0;max-width:100%}.qf-doc td,.qf-doc th{padding:2pt 5.4pt;vertical-align:top;border:1px solid #000}.qf-doc td>p,.qf-doc th>p{padding:0}',
@@ -742,10 +742,13 @@ function fitContainer(type: NodeType, kids: PMNode[]): PMNode[] {
 
   const result: PMNode[] = [];
   let match = type.contentMatch;
-  const queue = [...grouped];
-  let guard = 0;
-  while (queue.length && guard++ < 100000) {
-    const c = queue.shift()!;
+  // Walk the children in order; nodes put back for another try (unwrapped children, degraded
+  // paragraphs) go on a stack in front of the rest. Every retry is strictly smaller than the node
+  // it replaces, so the loop ends without a cap.
+  const back: PMNode[] = [];
+  let next = 0;
+  while (back.length || next < grouped.length) {
+    const c = back.length ? back.pop()! : grouped[next++];
     const m = match.matchType(c.type);
     if (m) { result.push(c); match = m; continue; }
     const fill = match.fillBefore(Fragment.from(c));
@@ -763,18 +766,16 @@ function fitContainer(type: NodeType, kids: PMNode[]): PMNode[] {
     }
     // Unwrap containers into this context, or degrade to a paragraph.
     if (!c.isLeaf && !c.isTextblock) {
-      const inner: PMNode[] = [];
-      c.forEach((x) => inner.push(x));
-      queue.unshift(...inner);
+      for (let i = c.childCount - 1; i >= 0; i--) back.push(c.child(i));
       continue;
     }
     if (c.isTextblock && c.type !== S.nodes.paragraph && match.matchType(S.nodes.paragraph)) {
-      queue.unshift(repairTextblock(S.nodes.paragraph, {}, [c]));
+      back.push(repairTextblock(S.nodes.paragraph, {}, [c]));
       continue;
     }
     if (c.isLeaf && c.isBlock) {
       const t = c.type === S.nodes.math_block ? c.attrs.latex : '';
-      if (t && match.matchType(S.nodes.paragraph)) queue.unshift(para([S.text(t)]));
+      if (t && match.matchType(S.nodes.paragraph)) back.push(para([S.text(t)]));
       continue;
     }
     // drop
@@ -839,15 +840,18 @@ export interface FlatListItem {
   task?: boolean;
   /** Text after an ordered list number ("." when absent). */
   suffix?: string;
+  /** Source list identity (RTF \ls, DOCX numId): a change starts a new list. */
+  ls?: number;
+  /** Continuation: more blocks of the last item at this level rather than a new item. */
+  cont?: boolean;
   blocks: PMNode[];
 }
 
-interface ListBuild { ordered: boolean; task: boolean; format: string; start: number; level: number; suffix?: string; items: { blocks: PMNode[]; checked: boolean | null; lists: (PMNode | ListBuild)[] }[] }
+interface ListBuild { ordered: boolean; task: boolean; format: string; start: number; level: number; suffix?: string; ls?: number; items: { content: (PMNode | ListBuild)[]; checked: boolean | null }[] }
 
 function listToNode(l: ListBuild): PMNode {
   const items = l.items.map((it) => {
-    const content: PMNode[] = [...it.blocks];
-    for (const sub of it.lists) content.push((sub as any).type ? (sub as PMNode) : listToNode(sub as ListBuild));
+    const content: PMNode[] = it.content.map((c) => ((c as any).type ? (c as PMNode) : listToNode(c as ListBuild)));
     if (!content.length || content[0].type !== S.nodes.paragraph) content.unshift(para());
     if (l.task) return S.nodes.task_item.create({ checked: !!it.checked }, content);
     return S.nodes.list_item.create({ checked: it.checked ?? null }, content);
@@ -867,23 +871,28 @@ export function buildNestedLists(entries: FlatListItem[]): PMNode[] {
     const task = !!e.task;
     while (stack.length && stack[stack.length - 1].level > level) stack.pop();
     let top = stack[stack.length - 1];
-    if (top && top.level === level && (top.ordered !== e.ordered || top.task !== task)) {
+    if (e.cont && top && top.level === level && top.items.length) {
+      top.items[top.items.length - 1].content.push(...e.blocks);
+      continue;
+    }
+    const newList = (): ListBuild => ({ ordered: e.ordered, task, format: e.format || (e.ordered ? 'decimal' : 'disc'), start: e.start || 1, level, items: [], suffix: e.suffix, ls: e.ls });
+    if (top && top.level === level && (top.ordered !== e.ordered || top.task !== task || (e.ls != null && top.ls != null && e.ls !== top.ls))) {
       stack.pop();
       top = stack[stack.length - 1];
-      const nl: ListBuild = { ordered: e.ordered, task, format: e.format || (e.ordered ? 'decimal' : 'disc'), start: e.start || 1, level, items: [], suffix: e.suffix };
-      if (top) top.items[top.items.length - 1]?.lists.push(nl); else roots.push(nl);
+      const nl = newList();
+      if (top) top.items[top.items.length - 1]?.content.push(nl); else roots.push(nl);
       stack.push(nl);
       top = nl;
     } else if (!top || top.level < level) {
-      const nl: ListBuild = { ordered: e.ordered, task, format: e.format || (e.ordered ? 'decimal' : 'disc'), start: e.start || 1, level, items: [], suffix: e.suffix };
+      const nl = newList();
       if (top) {
-        if (!top.items.length) top.items.push({ blocks: [], checked: null, lists: [] });
-        top.items[top.items.length - 1].lists.push(nl);
+        if (!top.items.length) top.items.push({ content: [], checked: null });
+        top.items[top.items.length - 1].content.push(nl);
       } else roots.push(nl);
       stack.push(nl);
       top = nl;
     }
-    top.items.push({ blocks: e.blocks, checked: e.checked ?? (task ? false : null), lists: [] });
+    top.items.push({ content: [...e.blocks], checked: e.checked ?? (task ? false : null) });
   }
   return roots.map(listToNode);
 }
@@ -899,7 +908,7 @@ export function markerFormat(marker: string): { ordered: boolean; format: string
   return { ordered: false, format: 'disc', start: 1 };
 }
 
-function romanValue(s: string): number {
+export function romanValue(s: string): number {
   const v: Record<string, number> = { i: 1, v: 5, x: 10, l: 50, c: 100, d: 500, m: 1000 };
   let n = 0;
   const l = s.toLowerCase();

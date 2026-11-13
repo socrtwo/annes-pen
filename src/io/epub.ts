@@ -12,6 +12,7 @@
  * to data URLs) and converted with the HTML importer. Title/author/language come from the OPF.
  */
 import JSZip from 'jszip';
+import { loadZip } from './zip';
 import { Fragment, type Node as PMNode } from 'prosemirror-model';
 import { styleLevel } from '../editor/schema';
 import { stylesCss } from '../editor/styles';
@@ -242,7 +243,7 @@ export async function importEpub(data: ArrayBuffer, name: string): Promise<PMNod
   void name;
   const settings = newSettings();
   let zip: JSZip;
-  try { zip = await JSZip.loadAsync(data); } catch { return finishDoc([], settings); }
+  try { zip = await loadZip(data); } catch { return finishDoc([], settings); }
   const read = async (p: string): Promise<string | null> => {
     const f = zip.file(p) || zip.file(safeDecode(p));
     return f ? f.async('string') : null;

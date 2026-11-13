@@ -58,14 +58,23 @@ export function stripInvalidXml(s: string): string {
   return s.replace(INVALID_XML, '');
 }
 
-/** Escape text for use in XML content or attribute values (also strips invalid characters). */
-export function esc(s: unknown): string {
-  return stripInvalidXml(String(s ?? ''))
+/**
+ * Escape text for XML content or attribute values, stripping characters XML 1.0 forbids (control
+ * characters, lone surrogates, U+FFFE/F). The one implementation for every XML/HTML writer;
+ * `apos` lets HTML use &#39; (HTML 4 has no &apos;).
+ */
+export function escapeXmlText(s: string, apos = '&apos;'): string {
+  return stripInvalidXml(s)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
+    .replace(/'/g, apos);
+}
+
+/** Escape text for use in XML content or attribute values (also strips invalid characters). */
+export function esc(s: unknown): string {
+  return escapeXmlText(String(s ?? ''));
 }
 
 export const XML_HEADER = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';

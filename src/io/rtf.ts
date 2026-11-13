@@ -22,7 +22,7 @@ import type { StyleDef } from '../editor/settings';
 import type { ExportOptions } from './index';
 import {
   S, buildNestedLists, bytesToHex, canonicalStyleName, collectFootnotes, docSettings, docTitle, finishDoc, hexToBytes, htmlToTextLines,
-  imagePixelSize, inlineAtomText, listStart, makeBlob, markSet, markerFormat, newSettings, para, parseDataUrl, prepareDoc, resolveFontName,
+  imagePixelSize, inlineAtomText, listStart, makeBlob, markSet, markerFormat, romanValue, newSettings, para, parseDataUrl, prepareDoc, resolveFontName,
   sniffImageMime, toDataUrl, toHexColor, normalizeImportedFormatting, type FlatListItem, type NoteInfo,
 } from './serialize';
 
@@ -94,6 +94,35 @@ function fieldInstruction(a: Attrs): string {
   }
   if (type === 'REF') inst += ' \\h';
   return inst;
+}
+
+/** The number in a list marker such as "3.", "iv)" or "1.2.c" (its last part), read in the level's format. */
+function markerNumber(marker: string, format: string): number | null {
+  const parts = marker.replace(/\t/g, '').trim().match(/[0-9]+|[a-zA-Z]+/g);
+  if (!parts) return null;
+  const t = parts[parts.length - 1];
+  if (format === 'decimal' || format === 'decimal-zero') return /^\d+$/.test(t) ? parseInt(t, 10) : null;
+  if (format === 'lower-alpha' || format === 'upper-alpha') {
+    // a..z, then aa, bb, ... (Word repeats the letter).
+    if (!/^([a-zA-Z])\1*$/.test(t)) return null;
+    return (t.toLowerCase().charCodeAt(0) - 96) + 26 * (t.length - 1);
+  }
+  if (format === 'lower-roman' || format === 'upper-roman') {
+    return /^[ivxlcdm]+$/i.test(t) ? romanValue(t) : null;
+  }
+  return null;
+}
+
+/** A quoted field-instruction argument: backslashes and quotes are escaped with a backslash. */
+function fieldQuote(s: string): string {
+  return `"${s.replace(/[\\"]/g, '\\$&')}"`;
+}
+
+/** Read a quoted field-instruction argument at the start of `s` (see fieldQuote). */
+function fieldUnquote(s: string): { value: string; rest: string } | null {
+  const m = /^"((?:[^"\\]|\\.)*)"/.exec(s);
+  if (!m) return null;
+  return { value: m[1].replace(/\\([\\"])/g, '$1'), rest: s.slice(m[0].length) };
 }
 
 class RtfWriter {
@@ -210,6 +239,7 @@ class RtfWriter {
     let s = '\\pard\\plain';
     if (opts.intbl) s += '\\intbl';
     s += `\\s${this.styleNum(styleName)}`;
+    if (a.dir === 'rtl') s += '\\rtlpar';
     s += this.paraStyleCodes(e, a);
     if (opts.extra) s += opts.extra;
     s += this.charStyleCodes(e);
@@ -300,9 +330,9 @@ class RtfWriter {
         let inner = '';
         while (j < kids.length && kids[j].marks.some((m) => m.eq(link))) { inner += this.run(kids[j], true); j++; }
         const href = String(link.attrs.href || '');
-        const inst = href.startsWith('#') ? `HYPERLINK \\\\l "${rtfEscape(href.slice(1))}"` : `HYPERLINK "${rtfEscape(href)}"`;
+        const inst = href.startsWith('#') ? `HYPERLINK \\l ${fieldQuote(href.slice(1))}` : `HYPERLINK ${fieldQuote(href.replace(/["\s]/g, (c) => encodeURIComponent(c)))}`;
         const lc = this.color('#0563c1');
-        out += `{\\field{\\*\\fldinst {${inst}}}{\\fldrslt {\\ul\\cf${lc} ${inner}}}}`;
+        out += `{\\field{\\*\\fldinst {${rtfEscape(inst)}}}{\\fldrslt {\\ul\\cf${lc} ${inner}}}}`;
         i = j;
         continue;
       }
@@ -670,7 +700,7 @@ export async function exportRtf(doc: PMNode, opts: ExportOptions): Promise<Blob>
 
 interface CharState {
   b: boolean; i: boolean; ul: string | null; strike: boolean; dstrike: boolean; sup: boolean; sub: boolean;
-  scaps: boolean; caps: boolean; v: boolean; f: number | null; fs: number | null; cf: number; hl: number; shade: number;
+  scaps: boolean; caps: boolean; v: boolean; rtl: boolean; f: number | null; fs: number | null; cf: number; hl: number; shade: number;
   expnd: number; scale: number; up: number;
   /** Tracked change: 1 insertion (\revised), 2 deletion (\deleted), with author index and DTTM. */
   rev: number; revAuth: number; revDt: number; revAuthDel: number; revDtDel: number;
@@ -678,7 +708,7 @@ interface CharState {
 interface ParaState {
   align: string | null; li: number; ri: number; fi: number; sb: number | null; sa: number | null; sl: number; slmult: number;
   keepn: boolean; keep: boolean; pagebb: boolean; outline: number | null; s: number | null; intbl: boolean; ls: number; ilvl: number; cbpat: number;
-  border: Record<string, string> | null;
+  border: Record<string, string> | null; rtl: boolean;
 }
 interface Sink { text: string; align: string | null; kind: string }
 interface FieldState { inst: string; hyperlink: string | null; resultStarted: boolean; startPara: number; startIdx: number; sinkStart: number; sink: Sink | null }
@@ -690,11 +720,12 @@ interface Group {
   ownsMeta: string | null; ownsAnnot: boolean; ownsShape: boolean; ownsShpTxt: boolean; ownsSp: boolean;
 }
 interface CellDef { right: number; mgf: boolean; mrg: boolean; vmgf: boolean; vmrg: boolean; bg: number; valign: string | null; borders?: Record<string, string> }
-type Entry = PMNode | { list: FlatListItem } | { sect: string };
+/** A list paragraph keeps its left indent so that following indented paragraphs can join its item. */
+type Entry = PMNode | { list: FlatListItem; li?: number } | { sect: string };
 interface RowBuild { cells: Entry[][]; defs: CellDef[]; header: boolean }
 
-const freshChar = (): CharState => ({ b: false, i: false, ul: null, strike: false, dstrike: false, sup: false, sub: false, scaps: false, caps: false, v: false, f: null, fs: null, cf: 0, hl: 0, shade: 0, expnd: 0, scale: 100, up: 0, rev: 0, revAuth: 0, revDt: 0, revAuthDel: 0, revDtDel: 0 });
-const freshPara = (): ParaState => ({ align: null, li: 0, ri: 0, fi: 0, sb: null, sa: null, sl: 0, slmult: 0, keepn: false, keep: false, pagebb: false, outline: null, s: null, intbl: false, ls: 0, ilvl: 0, cbpat: 0, border: null });
+const freshChar = (): CharState => ({ b: false, i: false, ul: null, strike: false, dstrike: false, sup: false, sub: false, scaps: false, caps: false, v: false, rtl: false, f: null, fs: null, cf: 0, hl: 0, shade: 0, expnd: 0, scale: 100, up: 0, rev: 0, revAuth: 0, revDt: 0, revAuthDel: 0, revDtDel: 0 });
+const freshPara = (): ParaState => ({ align: null, li: 0, ri: 0, fi: 0, sb: null, sa: null, sl: 0, slmult: 0, keepn: false, keep: false, pagebb: false, outline: null, s: null, intbl: false, ls: 0, ilvl: 0, cbpat: 0, border: null, rtl: false });
 
 const CHARSET_CP: Record<number, string> = {
   0: 'windows-1252', 1: 'windows-1252', 2: 'windows-1252', 77: 'macintosh', 128: 'shift_jis', 129: 'euc-kr', 130: 'euc-kr', 134: 'gbk', 136: 'big5',
@@ -915,6 +946,7 @@ export class RtfReader {
     if (c.scaps) out.push(M.smallcaps.create());
     if (c.caps) out.push(M.allcaps.create());
     if (c.v) out.push(M.hidden.create());
+    if (c.rtl) out.push(M.dir.create({ dir: 'rtl' }));
     const f = this.fonts.get(c.f ?? this.deff);
     if (f && f.name && !/^(symbol|wingdings|webdings)/i.test(f.name)) out.push(M.font.create({ family: f.name }));
     const fs = c.fs != null && c.fs > 0 ? c.fs : 24; // RTF default: 12pt
@@ -975,6 +1007,7 @@ export class RtfReader {
   paraAttrs(ps: ParaState, inList: boolean): Attrs {
     const a: Attrs = { style: this.styleName(ps) };
     if (ps.align) a.align = ps.align;
+    if (ps.rtl) a.dir = 'rtl';
     if (!inList) {
       if (ps.li) a.indentLeft = ps.li / 20;
       if (ps.fi) a.indentFirst = ps.fi / 20;
@@ -1017,6 +1050,9 @@ export class RtfReader {
           format = lv.nfc === 255 && !ch ? 'none' : rtfBullet(ch);
         } else {
           ordered = true; format = map[lv.nfc] || 'decimal'; start = lv.start || 1;
+          // The number actually shown: a list that resumes after other paragraphs goes on counting.
+          const shown = this.marker != null ? markerNumber(this.marker, format) : null;
+          if (shown != null) start = shown;
           const tail = lt.slice(1).split(/[\u0000-\u0008]/).pop() || '';
           if (tail.trim() && tail.trim().length <= 2) suffix = tail.trim();
         }
@@ -1039,7 +1075,7 @@ export class RtfReader {
     }
     if (!isList) return null;
     const task = /^[☐☒☑]\s?/.test(text);
-    return { level: Math.min(8, level), ordered: task ? false : ordered, format, start, task, checked: task ? !/^☐/.test(text) : null, blocks: [], ...(suffix ? { suffix } : {}) } as FlatListItem;
+    return { level: Math.min(8, level), ordered: task ? false : ordered, format, start, task, checked: task ? !/^☐/.test(text) : null, blocks: [], ...(suffix ? { suffix } : {}), ...(ps.ls > 0 ? { ls: ps.ls } : {}) } as FlatListItem;
   }
 
   endPara(kind: 'par' | 'cell' | 'eof'): void {
@@ -1066,15 +1102,28 @@ export class RtfReader {
     }
     this.marker = null;
     this.pn = null;
-    const node = S.nodes.paragraph.create(this.paraAttrs(ps, !!li), inlines.length ? inlines : null);
-    const entry: Entry = li ? { list: { ...li, blocks: [node] } } : node;
-    if (ps.intbl || kind === 'cell') {
+    const inTable = ps.intbl || kind === 'cell';
+    if (!inTable && this.table) this.closeTable();
+    const target = inTable ? this.table?.curCell : this.blocks;
+    // An unnumbered paragraph indented like a list item just before it continues that item.
+    const owner = !li && ps.li > 0 && target ? this.continuedItem(target, ps.li) : null;
+    const node = S.nodes.paragraph.create(this.paraAttrs(ps, !!li || !!owner), inlines.length ? inlines : null);
+    const entry: Entry = li ? { list: { ...li, blocks: [node] }, li: ps.li }
+      : owner ? { list: { ...owner, cont: true, blocks: [node] }, li: ps.li } : node;
+    if (inTable) {
       if (!this.table) this.table = { rows: [], curRow: [], curCell: [], defs: [], pending: { ...this.pendingCell }, header: false };
       this.table.curCell.push(entry);
-    } else {
-      if (this.table) this.closeTable();
-      this.blocks.push(entry);
+    } else this.blocks.push(entry);
+  }
+
+  /** The list item an indented paragraph continues: the nearest earlier item of the same list run with that indent. */
+  continuedItem(entries: Entry[], li: number): FlatListItem | null {
+    for (let k = entries.length - 1; k >= 0; k--) {
+      const e = entries[k] as { list?: FlatListItem; li?: number };
+      if (!e.list) return null;
+      if (e.li === li && !e.list.cont) return e.list;
     }
+    return null;
   }
 
   hasPendingContent(): boolean {
@@ -1306,9 +1355,13 @@ export class RtfReader {
     const type = m[1].toUpperCase();
     const rest = m[2];
     if (type === 'HYPERLINK') {
-      const anchor = /\\l\s+"([^"]*)"/.exec(rest) || /\\l\s+(\S+)/.exec(rest);
-      const url = /^"([^"]*)"/.exec(rest) || /^([^\s\\]+)/.exec(rest);
-      const href = url ? url[1] + (anchor ? '#' + anchor[1] : '') : anchor ? '#' + anchor[1] : '';
+      let url: string | null = null, tail = rest;
+      const q = fieldUnquote(rest);
+      if (q) { url = q.value; tail = q.rest; }
+      else { const b = /^([^\s\\]+)/.exec(rest); if (b) { url = b[1]; tail = rest.slice(b[0].length); } }
+      const am = /\\l\s+(.*)$/.exec(tail);
+      const anchor = am ? (fieldUnquote(am[1])?.value ?? am[1].split(/\s/)[0]) : null;
+      const href = url ? url + (anchor ? '#' + anchor : '') : anchor ? '#' + anchor : '';
       return { type, arg: null, format: null, href: href || null };
     }
     if (type.startsWith('=')) return { type: '=', arg: (type.slice(1) + ' ' + rest.replace(/\\#.*$/, '')).trim(), format: (/\\#\s*"([^"]*)"/.exec(rest) || [])[1] || null, href: null };
@@ -1688,6 +1741,8 @@ export class RtfReader {
       case 'intbl': pa.intbl = true; return;
       case 'itap': if (p > 0) pa.intbl = true; return;
       case 'ls': pa.ls = p; return;
+      case 'rtlpar': pa.rtl = true; return;
+      case 'ltrpar': pa.rtl = false; return;
       case 'ilvl': pa.ilvl = p; return;
       case 'cbpat': pa.cbpat = p; return;
       // Borders: the side word selects the target, the following \brdr* words describe it.
@@ -1741,6 +1796,8 @@ export class RtfReader {
       case 'scaps': c.scaps = on; return;
       case 'caps': c.caps = on; return;
       case 'v': c.v = on; return;
+      case 'rtlch': c.rtl = true; return;
+      case 'ltrch': c.rtl = false; return;
       case 'f': c.f = p; return;
       case 'fs': c.fs = p; return;
       case 'cf': c.cf = p; return;
@@ -1793,8 +1850,8 @@ export class RtfReader {
     const s = this.s;
     const len = s.length;
     let starred = false;
-    let guard = 0;
-    while (this.pos < len && guard++ < 50_000_000) {
+    // Every step consumes at least one character.
+    while (this.pos < len) {
       const ch = s[this.pos];
       // Groups nested deeper than any real document share the deepest state (each level copies it).
       if (ch === '{') { if (this.groups.length < RTF_MAX_DEPTH) this.pushGroup(); else this.overflow++; this.pos++; starred = false; continue; }
@@ -1829,6 +1886,14 @@ export class RtfReader {
         if (nx === '*') { starred = true; this.pos += 2; continue; }
         this.pos += 2;
         try { this.symbol(nx); } catch { /* ignore */ }
+        continue;
+      }
+      if (this.g.dest === 'pict' && this.ucSkip === 0) {
+        // Picture hex: the whole run up to the next control character at once.
+        let j = this.pos + 1;
+        while (j < len) { const c = s.charCodeAt(j); if (c === 92 || c === 123 || c === 125) break; j++; }
+        this.pict?.hex.push(s.slice(this.pos, j));
+        this.pos = j;
         continue;
       }
       if (ch === '\r' || ch === '\n') { this.pos++; continue; }

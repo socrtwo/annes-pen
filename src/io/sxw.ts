@@ -20,7 +20,7 @@
  *   made package-relative); office:annotation and change-info attributes → dc:creator/dc:date;
  * - office:body content → office:body/office:text.
  */
-import JSZip from 'jszip';
+import { loadZip } from './zip';
 import type { Node as PMNode } from 'prosemirror-model';
 import { odfPartsToDoc } from './odt';
 import { decodeXml, parseXml } from './xml-read';
@@ -306,7 +306,7 @@ export async function importSxw(data: ArrayBuffer, name: string): Promise<PMNode
     if (!d) return textFallback(text);
     return odfPartsToDoc({ content: d, styles: d, meta: d, files: new Map() });
   }
-  const zip = await JSZip.loadAsync(data);
+  const zip = await loadZip(data);
   const read = async (p: string) => { const f = zip.file(p); return f ? decodeXml(await f.async('uint8array')) : null; };
   const contentXml = await read('content.xml');
   if (!contentXml) throw new Error('content.xml is missing: not a StarOffice/OpenOffice.org document');

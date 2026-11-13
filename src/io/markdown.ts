@@ -146,8 +146,12 @@ function parseBlocks(lines: string[], ctx: Ctx): MdBlock[] {
     paraLines = null;
   };
   const n = lines.length;
-  let guard = 0;
-  while (i < n && guard++ < 1_000_000) {
+  let last = -1;
+  while (i < n) {
+    // Every branch consumes at least one line; this makes that a guarantee.
+    if (i <= last) i = last + 1;
+    if (i >= n) break;
+    last = i;
     const line = lines[i];
     if (isBlank(line)) { closePara(); i++; continue; }
     const ind = indentOf(line);
@@ -436,15 +440,32 @@ function parseAttrs(s: string): Record<string, string> {
   return out;
 }
 
-function parseLinkTail(src: string, j: number): { dest: string; title: string | null; end: number } | null {
+/** What earlier link-tail scans learned about the rest of the text, so repeated failures stay linear. */
+interface TailMemo { find: (ch: string, from: number) => number; noClose: Record<string, number> }
+
+/** src.indexOf(ch, from) that reuses the last answer for each character while it still holds. */
+function indexFinder(src: string): (ch: string, from: number) => number {
+  const last: Record<string, { from: number; at: number }> = {};
+  return (ch, from) => {
+    const c = last[ch];
+    if (c && from >= c.from && (c.at < 0 || from <= c.at)) return c.at;
+    const at = src.indexOf(ch, from);
+    last[ch] = { from, at };
+    return at;
+  };
+}
+
+function parseLinkTail(src: string, j: number, memo: TailMemo = { find: indexFinder(src), noClose: {} }): { dest: string; title: string | null; end: number } | null {
   if (src[j] !== '(') return null;
   let k = j + 1;
   const skipWs = () => { while (k < src.length && /[ \t\n]/.test(src[k])) k++; };
   skipWs();
   let dest = '';
   if (src[k] === '<') {
-    const e = src.indexOf('>', k);
-    if (e < 0 || src.slice(k, e).includes('\n')) return null;
+    const e = memo.find('>', k);
+    if (e < 0) return null;
+    const nl = memo.find('\n', k);
+    if (nl >= 0 && nl < e) return null;
     dest = src.slice(k + 1, e);
     k = e + 1;
   } else {
@@ -454,7 +475,8 @@ function parseLinkTail(src: string, j: number): { dest: string; title: string | 
       const c = src[k];
       if (c === '\\' && k + 1 < src.length && ASCII_PUNCT.test(src[k + 1])) { k += 2; continue; }
       if (/[\s]/.test(c) || c.charCodeAt(0) < 32) break;
-      if (c === '(') depth++;
+      // Parentheses nest at most 32 deep (as in cmark), which keeps unclosed "(" runs linear.
+      if (c === '(') { if (++depth > 32) return null; }
       if (c === ')') { if (depth === 0) break; depth--; }
       k++;
     }
@@ -467,9 +489,11 @@ function parseLinkTail(src: string, j: number): { dest: string; title: string | 
   const q = src[k];
   if ((q === '"' || q === "'" || q === '(') && k > beforeTitle) {
     const close = q === '(' ? ')' : q;
+    // No unescaped closer after an earlier opener means none after this one either.
+    if (k >= (memo.noClose[close] ?? Infinity)) return null;
     let e = k + 1;
     while (e < src.length && src[e] !== close) { if (src[e] === '\\') e++; e++; }
-    if (e >= src.length) return null;
+    if (e >= src.length) { memo.noClose[close] = Math.min(memo.noClose[close] ?? Infinity, k); return null; }
     title = unescapeMd(src.slice(k + 1, e));
     k = e + 1;
     skipWs();
@@ -589,13 +613,21 @@ function parseInline(src: string, ctx: Ctx): Inl[] {
   const pushText = () => { if (text) { nodes.push({ t: 'text', v: text }); text = ''; } };
   let i = 0;
   const len = src.length;
-  let guard = 0;
   let closers: number[] | null = null, nextCloser = 0;
-  while (i < len && guard++ < 2_000_000) {
+  const memo: TailMemo = { find: indexFinder(src), noClose: {} };
+  let noCommentEnd = Infinity;
+  // Drop trailing spaces (and tabs) from the text collected since the last line break.
+  const trimEnd = (tabs: boolean) => {
+    let e = text.length;
+    while (e > 0 && (text.charCodeAt(e - 1) === 32 || (tabs && text.charCodeAt(e - 1) === 9))) e--;
+    if (e < text.length) text = text.slice(0, e);
+  };
+  // Every branch consumes at least one character.
+  while (i < len) {
     const c = src[i];
     if (c === '\\') {
       const nx = src[i + 1];
-      if (nx === '\n') { text = text.replace(/ +$/, ''); pushText(); nodes.push({ t: 'br' }); i += 2; while (src[i] === ' ' || src[i] === '\t') i++; continue; }
+      if (nx === '\n') { trimEnd(false); pushText(); nodes.push({ t: 'br' }); i += 2; while (src[i] === ' ' || src[i] === '\t') i++; continue; }
       if (nx && ASCII_PUNCT.test(nx)) { text += nx; i += 2; continue; }
       text += '\\'; i++; continue;
     }
@@ -678,7 +710,7 @@ function parseInline(src: string, ctx: Ctx): Inl[] {
       const labelText = src.slice(opener.pos, i);
       let j = i + 1;
       let dest: string | null = null, title: string | null = null;
-      const tail = parseLinkTail(src, j);
+      const tail = parseLinkTail(src, j, memo);
       if (tail) { dest = tail.dest; title = tail.title; j = tail.end; }
       else {
         const rm = /^\[((?:[^\]\\]|\\.){0,999})\]/.exec(src.slice(j, j + 1000));
@@ -707,7 +739,7 @@ function parseInline(src: string, ctx: Ctx): Inl[] {
       if (m) { pushText(); nodes.push({ t: 'link', href: m[1], title: null, kids: [{ t: 'text', v: m[1] }] }); i += m[0].length; continue; }
       m = EMAIL_RE.exec(rest);
       if (m) { pushText(); nodes.push({ t: 'link', href: 'mailto:' + m[1], title: null, kids: [{ t: 'text', v: m[1] }] }); i += m[0].length; continue; }
-      if (rest.startsWith('<!--')) { const e = src.indexOf('-->', i + 4); if (e >= 0) { i = e + 3; continue; } }
+      if (rest.startsWith('<!--') && i < noCommentEnd) { const e = src.indexOf('-->', i + 4); if (e >= 0) { i = e + 3; continue; } noCommentEnd = i; }
       m = TAG_RE.exec(rest);
       if (m) { pushText(); nodes.push({ t: 'tag', name: m[2].toLowerCase(), close: !!m[1], attrs: parseAttrs(m[3]) }); if (m[4]) { /* self-closing */ } i += m[0].length; continue; }
       text += '<'; i++; continue;
@@ -718,8 +750,11 @@ function parseInline(src: string, ctx: Ctx): Inl[] {
       text += '&'; i++; continue;
     }
     if (c === '\n') {
-      if (/ {2,}$/.test(text) || /\t$/.test(text)) { text = text.replace(/[ \t]+$/, ''); pushText(); nodes.push({ t: 'br' }); }
-      else { text = text.replace(/ +$/, ''); text += ' '; }
+      const tl = text.length;
+      const hard = (tl >= 2 && text.charCodeAt(tl - 1) === 32 && text.charCodeAt(tl - 2) === 32) || (tl >= 1 && text.charCodeAt(tl - 1) === 9);
+      if (hard) { trimEnd(true); pushText(); nodes.push({ t: 'br' }); }
+      // The text ends here so the next line's checks only look at that line.
+      else { trimEnd(false); text += ' '; pushText(); }
       i++;
       while (src[i] === ' ' || src[i] === '\t') i++;
       continue;
@@ -792,7 +827,7 @@ function inlToPM(nodes: Inl[], marks: readonly Mark[], conv: Conv, out: PMNode[]
 function inlineNodes(text: string, conv: Conv): PMNode[] {
   const out: PMNode[] = [];
   try {
-    inlToPM(parseInline(text.replace(/\s+$/, ''), conv.ctx), [], conv, out);
+    inlToPM(parseInline(text.trimEnd(), conv.ctx), [], conv, out);
   } catch {
     if (text) out.push(S.text(text));
   }
@@ -1009,8 +1044,18 @@ function inlineMd(node: PMNode, w: WCtx, lineBreak = '\\\n'): string {
     if (c.isText) segs.push({ kind: 'text', text: c.text || '', node: c, marks: mdMarks(c.marks) });
     else segs.push({ kind: 'atom', text: '', node: c, marks: mdMarks(c.marks) });
   });
-  let out = '';
-  const stack: { mark: Mark; opened: string }[] = [];
+  // A hard break at the end of a block has nothing to break before (and "\" would be literal text).
+  while (segs.length && segs[segs.length - 1].kind === 'atom' && segs[segs.length - 1].node.type === S.nodes.hard_break) segs.pop();
+  // Output pieces; delimiter marks remember where they opened and closed so that runs which would
+  // not parse as emphasis (such as "**bold.**next") can fall back to HTML tags.
+  const out: string[] = [];
+  const pairs: { mark: string; open: number; close: number }[] = [];
+  const stack: { mark: Mark; opened: string; at: number }[] = [];
+  const closeTop = () => {
+    const s = stack.pop()!;
+    if (s.at >= 0) pairs.push({ mark: s.mark.type.name, open: s.at, close: out.length });
+    out.push(closeMark(s.mark, s.opened));
+  };
   let pendingTrail = '';
   const prefixLen = (want: Mark[]) => { let k = 0; while (k < stack.length && k < want.length && stack[k].mark.eq(want[k])) k++; return k; };
   for (let idx = 0; idx < segs.length; idx++) {
@@ -1025,25 +1070,61 @@ function inlineMd(node: PMNode, w: WCtx, lineBreak = '\\\n'): string {
     }
     if (seg.kind === 'atom' && seg.node.type.name === 'hard_break') want = stack.slice(0, prefixLen(want)).map((x) => x.mark);
     const k = prefixLen(want);
-    while (stack.length > k) { const s = stack.pop()!; out += closeMark(s.mark, s.opened); }
-    out += pendingTrail; pendingTrail = '';
-    out += lead.replace(/\u00a0/g, '&nbsp;');
+    while (stack.length > k) closeTop();
+    out.push(pendingTrail); pendingTrail = '';
+    out.push(lead.replace(/\u00a0/g, '&nbsp;'));
     for (let x = k; x < want.length; x++) {
       let codeContent = '';
       if (want[x].type.name === 'code') {
         for (let y = idx; y < segs.length && segs[y].marks.some((m) => m.type.name === 'code'); y++) codeContent += segs[y].text;
       }
       const opened = openMark(want[x], codeContent);
-      out += opened;
-      stack.push({ mark: want[x], opened });
+      stack.push({ mark: want[x], opened, at: HTML_DELIM[want[x].type.name] ? out.length : -1 });
+      out.push(opened);
     }
-    if (seg.kind === 'text') out += hasCode ? core : escapeText(core);
-    else out += atomMd(seg.node, w, lineBreak);
+    if (seg.kind === 'text') out.push(hasCode ? core : escapeText(core));
+    else out.push(atomMd(seg.node, w, lineBreak));
     pendingTrail = trail.replace(/\u00a0/g, '&nbsp;');
   }
-  while (stack.length) { const s = stack.pop()!; out += closeMark(s.mark, s.opened); }
-  out += pendingTrail;
-  return out;
+  while (stack.length) closeTop();
+  out.push(pendingTrail);
+  fixFlanking(out, pairs);
+  return out.join('');
+}
+
+const HTML_DELIM: Record<string, string> = { bold: 'strong', italic: 'em', strike: 'del', highlight: 'mark' };
+
+/**
+ * CommonMark only reads a delimiter run as an opener when it is left-flanking and as a closer when
+ * it is right-flanking ("**bold.**next" is neither bold nor closed). Such pairs are written as HTML.
+ */
+function fixFlanking(out: string[], pairs: { mark: string; open: number; close: number }[]): void {
+  if (!pairs.length) return;
+  const delimAt = new Map<number, string>();
+  for (const p of pairs) { delimAt.set(p.open, out[p.open][0]); delimAt.set(p.close, out[p.close][0]); }
+  // The character next to a delimiter run: adjacent delimiters of the same character are one run.
+  const near = (i: number, dir: -1 | 1) => {
+    const ch = delimAt.get(i);
+    for (let j = i + dir; j >= 0 && j < out.length; j += dir) {
+      if (!out[j]) continue;
+      if (delimAt.get(j) === ch) continue;
+      return dir < 0 ? out[j][out[j].length - 1] : out[j][0];
+    }
+    return '';
+  };
+  const ws = (c: string) => !c || /\s/.test(c);
+  const punct = (c: string) => !!c && /[\p{P}\p{S}]/u.test(c);
+  const leftFlank = (b: string, a: string) => !ws(a) && (!punct(a) || ws(b) || punct(b));
+  const rightFlank = (b: string, a: string) => !ws(b) && (!punct(b) || ws(a) || punct(a));
+  const bad: typeof pairs = [];
+  for (const p of pairs) {
+    if (!leftFlank(near(p.open, -1), near(p.open, 1)) || !rightFlank(near(p.close, -1), near(p.close, 1))) bad.push(p);
+  }
+  for (const p of bad) {
+    const tag = HTML_DELIM[p.mark];
+    out[p.open] = `<${tag}>`;
+    out[p.close] = `</${tag}>`;
+  }
 }
 
 function indentLines(s: string, first: string, rest: string): string {
@@ -1054,7 +1135,8 @@ function paragraphMd(node: PMNode, w: WCtx): string {
   const style = node.attrs.style as string;
   const lvl = styleLevel(style, node.attrs.outlineLevel);
   if (lvl > 0 || style === 'Title') {
-    const text = inlineMd(node, w, ' ').replace(/\n/g, ' ').trim();
+    // A closing run of "#" would be read as the optional closing sequence.
+    const text = inlineMd(node, w, ' ').replace(/\n/g, ' ').trim().replace(/(^|[ \t])(#+)$/, '$1\\$2');
     if (!text) return '';
     return `${'#'.repeat(style === 'Title' ? 1 : Math.min(6, lvl))} ${text}`;
   }
@@ -1123,8 +1205,10 @@ function listMd(node: PMNode, w: WCtx): string {
       const s = blockMd(b, w);
       if (s == null) return;
       const isList = b.type === S.nodes.bullet_list || b.type === S.nodes.ordered_list || b.type === S.nodes.task_list;
+      // An item can't start with a blank line before more content: an empty first paragraph is left out.
+      if (i === 1 && parts.length === 1 && parts[0] === '' && !task) { parts[0] = s; prevList = isList; return; }
       if (i === 0) parts.push(s);
-      else parts.push((isList && !prevList && parts.length === 1 ? '\n' : '\n\n') + s);
+      else parts.push((isList && !prevList && parts.length === 1 && canInterrupt(b) ? '\n' : '\n\n') + s);
       prevList = isList;
     });
     const body = parts.join('') || '';
@@ -1132,6 +1216,13 @@ function listMd(node: PMNode, w: WCtx): string {
     items.push(indentLines(task + body, marker, pad));
   });
   return items.join('\n');
+}
+
+/** Whether a list can follow its item's first paragraph without a blank line (CommonMark: only a list starting at 1 with a non-empty first item). */
+function canInterrupt(list: PMNode): boolean {
+  if (list.type === S.nodes.ordered_list && listStart(list.attrs.order) !== 1) return false;
+  const first = list.firstChild;
+  return !!first && !!first.firstChild && first.firstChild.isTextblock && first.firstChild.content.size > 0;
 }
 
 function blockMd(node: PMNode, w: WCtx): string | null {
