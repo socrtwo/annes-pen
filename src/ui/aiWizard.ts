@@ -39,7 +39,7 @@ export async function openAiSetup(app: App, opts: { provider?: string; reason?: 
     reset();
     clear(root);
     if (opts.reason) root.append(h('p', { class: 'qf-ai-reason' }, opts.reason));
-    root.append(h('p', { class: 'qf-help' }, 'Pick where QuillPen\'s AI features should run. You can add several and switch at any time (AI ▸ Providers & Models).'));
+    root.append(h('p', { class: 'qf-help' }, 'Pick where Anne\'s Pen\'s AI features should run. You can add several and switch at any time (AI ▸ Providers & Models).'));
     const s = aiSettings();
     for (const sec of SECTIONS) {
       root.append(h('h3', null, sec.title), h('p', { class: 'qf-help' }, sec.help));

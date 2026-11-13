@@ -8,8 +8,8 @@ The Android app is the Anne's Pen web core (TypeScript/Vite, built into `dist/`)
 | --- | --- |
 | Application ID | `io.github.socrtwo.quillpen` |
 | minSdk / targetSdk / compileSdk | 24 (Android 7.0) / 36 / 36 (`android/variables.gradle`) |
-| versionName | `version` from the root `package.json` |
-| versionCode | `VERSION_CODE` environment variable, default `1` (CI uses the workflow run number) |
+| versionName | `version` from the root `package.json` (or `VERSION_NAME`) |
+| versionCode | `VERSION_CODE` environment variable, default `1`; CI derives it from the version (see *Version codes*) |
 | Java / Gradle | JDK 21, Gradle wrapper 8.14.3, Android Gradle Plugin 8.13 |
 
 ## Build locally
@@ -35,7 +35,8 @@ Then either:
   ./gradlew installDebug                     # install on a connected device / emulator
   ```
 
-`npm run android:build` runs build + sync + `assembleRelease` in one go.
+`npm run android:build` runs build + sync + `assembleRelease` in one go. A release build needs the
+release keystore (see *Signing*); for a debug-signed test build set `ALLOW_DEBUG_SIGNING=true`.
 
 Run `npx cap sync android` again after every web build; the web assets in
 `android/app/src/main/assets/public/` and `android/capacitor-cordova-android-plugins/` are generated
@@ -43,27 +44,44 @@ and git-ignored.
 
 ## Continuous integration and releases
 
-`.github/workflows/android.yml` runs on every push (any branch), on pull requests, on `v*` tags and
-manually (`workflow_dispatch`). Documentation-only changes do not trigger it. Steps:
+`.github/workflows/android.yml` runs on every push (any branch), on pull requests and manually
+(`workflow_dispatch`). Documentation-only changes do not trigger it. It calls the reusable
+`.github/workflows/android-build.yml`:
 
 1. `npm ci`, `npm run typecheck`, `npm test`, `npm run build` (all required to pass).
-2. JDK 21 (Temurin), Gradle cache, Android SDK (`android-actions/setup-android@v3`).
+2. JDK 21 (Temurin), Gradle cache, Android SDK (`android-actions/setup-android`).
 3. `npx cap sync android`.
-4. Decode the release keystore from secrets, if configured.
-5. `./gradlew assembleRelease bundleRelease`.
-6. Upload `QuillPen-<version>.apk` and `QuillPen-<version>.aab` as workflow artifacts
+4. `./gradlew assembleRelease bundleRelease`, signed with the debug key (`ALLOW_DEBUG_SIGNING=true`):
+   branch builds never see the release keystore.
+5. Upload `Annes-Pen-<version>.apk` and `Annes-Pen-<version>.aab` as workflow artifacts
    (Actions run page -> *Artifacts*).
 
 Publishing:
 
-- **Tagged release:** bump `version` in `package.json`, commit, then
-  `git tag v0.1.0 && git push origin v0.1.0`. The workflow creates a GitHub Release named after the tag
-  with the APK, AAB and `SHA256SUMS.txt` attached (tags containing `-`, e.g. `v0.2.0-beta.1`, are marked
-  prerelease). The workflow warns if the tag does not match `package.json`.
-- **Prerelease from any branch, without tagging:** Actions -> *Android* -> *Run workflow*, choose the
+- **Release:** `.github/workflows/release.yml` builds every platform, including the Android APK and AAB
+  signed with the release key, and publishes them as one GitHub Release. Bump `version` in
+  `package.json`, commit to `main`, then `git tag v0.5.0 && git push origin v0.5.0` (the tag must be
+  `v` + the `package.json` version; `v0.6.0-beta.1` style tags are prereleases). See
+  [BUILD.md](BUILD.md#releases) for the other triggers. A signed release fails if the keystore secrets
+  are missing; the rest of the release is still published without Android.
+- **Debug-signed test build from any branch:** Actions -> *Android* -> *Run workflow*, choose the
   branch, tick **prerelease**. This publishes a GitHub prerelease called
-  `Anne's Pen <version> (build <run number>)` under the tag `v<version>-build.<run number>` pointing at
-  that commit.
+  `Anne's Pen <version> (Android build <run number>)` under the tag `v<version>-android.<run number>`
+  pointing at that commit. Being debug-signed, it cannot update an installed signed release (uninstall
+  first, which deletes the app's data).
+
+### Version codes
+
+`scripts/android-version-code.mjs` computes the `versionCode` from the `package.json` version:
+
+    versionCode = major * 1000000 + minor * 10000 + patch * 100 + n
+
+- `n = 99` for an official release (tag `v<version>`), so 0.5.0 is 50099.
+- Every other build (branch CI, test prereleases, `-beta` tags) uses `n` = the number of commits since
+  `package.json` got its current version, capped at 98: test builds of 0.5.0 are 50000-50098, rise with
+  each commit, and always sort below the 0.5.0 release.
+- Bump `package.json` right after a release: test builds made while it still says 0.5.0 sort below the
+  installed 0.5.0 release. The codes are above every earlier run-number code, so updates keep working.
 
 ## Signing
 
@@ -76,8 +94,9 @@ Publishing:
 | `ANDROID_KEY_ALIAS` | Key alias inside the keystore |
 | `ANDROID_KEY_PASSWORD` | Key password (defaults to the store password if empty) |
 
-If `ANDROID_KEYSTORE_PATH` is not set (or the file does not exist) the **release build is signed with
-the Android debug key**. That APK installs fine for sideloading and testing, but:
+If `ANDROID_KEYSTORE_PATH` is not set (or the file does not exist) a **release build fails**, unless
+`ALLOW_DEBUG_SIGNING=true` is set: then it is signed with the Android debug key (branch CI and
+`scripts/termux-build.sh` do this). That APK installs fine for sideloading and testing, but:
 
 - Google Play rejects debug-signed bundles - you need a real upload key for the store.
 - Debug keys differ between machines/runners, so a debug-signed build cannot be installed *over* a build
@@ -111,8 +130,8 @@ Repository -> *Settings* -> *Secrets and variables* -> *Actions* -> *New reposit
 | `ANDROID_KEY_ALIAS` | `quillpen` (or the alias you chose) |
 | `ANDROID_KEY_PASSWORD` | the key password |
 
-The workflow decodes the keystore to `$RUNNER_TEMP` and exports `ANDROID_KEYSTORE_PATH`; release
-outputs are then properly signed. For Google Play, enroll in Play App Signing and use this key as the
+The release workflow decodes the keystore to `$RUNNER_TEMP` (only in release runs, not in branch CI)
+and exports `ANDROID_KEYSTORE_PATH`; release outputs are then properly signed. For Google Play, enroll in Play App Signing and use this key as the
 upload key.
 
 Signing locally works the same way:
@@ -125,11 +144,11 @@ cd android && ./gradlew assembleRelease bundleRelease
 
 ## Install (sideload) the APK
 
-1. Download `QuillPen-<version>.apk` from a GitHub Release (or a workflow run's artifacts - those are
+1. Download `Annes-Pen-<version>.apk` from a GitHub Release (or a workflow run's artifacts - those are
    zipped, unzip first).
 2. On the phone, open the APK from the browser or file manager. Android asks to allow installing apps
    from that source (*Settings -> Apps -> Special app access -> Install unknown apps*); allow it.
-3. Or from a computer with USB debugging: `adb install -r QuillPen-<version>.apk`.
+3. Or from a computer with USB debugging: `adb install -r Annes-Pen-<version>.apk`.
 
 If the installer says the package conflicts with an existing one, the installed copy was signed with a
 different key - uninstall it first (this deletes app data).
@@ -141,10 +160,18 @@ The `.aab` is for Google Play only; it cannot be installed directly.
 - **Open / Save As** use the system document picker (Storage Access Framework), so files in Drive,
   Dropbox, SD cards, etc. work and no storage permission is needed. Ctrl+S writes back to the same
   document via a persisted URI permission.
-- **Open with Anne's Pen** for `.docx`, `.odt`, `.rtf`, `.md`, `.txt`, `.html`, `.epub` and `.qpd`
-  (`ACTION_VIEW`), and **Share to Anne's Pen** (`ACTION_SEND`, files or plain text).
+- **Open with Anne's Pen** (`ACTION_VIEW`) for Word (`.docx`, `.docm`, `.doc`), OpenDocument (`.odt`),
+  RTF, Markdown, plain text, HTML, EPUB, Anne's Pen `.qpd` (and QuillForge `.qfd`), WordPerfect,
+  Works, Write, Lotus Word Pro / Ami Pro, Hangul, MacWrite, ClarisWorks, WordStar, XyWrite, email
+  (`.eml`, `.msg`) and MHTML, by MIME type or file extension (`android/app/src/main/AndroidManifest.xml`).
+  Only `content:` URIs from other apps are accepted; `file:` URIs and the app's own providers are refused.
+- **Share to Anne's Pen** (`ACTION_SEND`) for `.docx`, `.doc`, `.odt`, RTF, Markdown, plain text, HTML
+  and EPUB files, or plain text.
 - **Print** goes through Android's print service, which also offers *Save as PDF*.
 - **Share** sends the exported file to any app via the share sheet.
+- **Backup:** Android backup is off (`allowBackup="false"`). On Android 12+, device-to-device transfer
+  keeps drafts and settings but not the Keystore-encrypted API keys, which cannot be decrypted on another
+  device anyway (`res/xml/data_extraction_rules.xml`).
 - The activity is `singleTask`, so opening another file while Anne's Pen runs delivers it to the running
   instance (`fileOpened` event).
 

@@ -1,7 +1,7 @@
 // AI end-to-end: a mock OpenAI-compatible server (SSE streaming, CORS) and the real app in Chromium.
 // Verifies the wizard, streaming previews, word-level replacement, tracked AI edits, comments,
 // tables from Markdown, new documents, the AI pane, error handling, and the Anthropic/Gemini adapters.
-import { chromium } from 'playwright';
+import { launchChromium } from './browser.mjs';
 import http from 'node:http';
 import fs from 'node:fs';
 
@@ -84,8 +84,7 @@ const server = http.createServer((req, res) => {
 });
 await new Promise((r) => server.listen(PORT, r));
 
-const exe = ['/opt/pw-browsers/chromium-1194/chrome-linux/chrome', '/opt/pw-browsers/chromium'].find((p) => fs.existsSync(p) && fs.statSync(p).isFile());
-const browser = await chromium.launch(exe ? { executablePath: exe } : {});
+const browser = await launchChromium();
 const ctx = await browser.newContext({ viewport: { width: 1280, height: 860 } });
 const page = await ctx.newPage();
 const errors = [];

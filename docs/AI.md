@@ -17,7 +17,7 @@ You can set up several providers and switch between them with **AI ▸ Active AI
 
 ### The on-device model (free, private, offline)
 
-Anne's Pen downloads a small open model once and runs it on the device with [Transformers.js](https://huggingface.co/docs/transformers.js). It uses WebGPU when the device has it and the CPU (WebAssembly) otherwise. The library comes from cdn.jsdelivr.net (pinned to version 4.2.0) and the model from huggingface.co. After that the model works offline from the browser cache.
+Anne's Pen downloads a small open model once and runs it on the device with [Transformers.js](https://huggingface.co/docs/transformers.js). It uses WebGPU when the device has it and the CPU (WebAssembly) otherwise. The library comes from cdn.jsdelivr.net (pinned to version 4.2.0, together with the ONNX Runtime Web files it loads; there is no integrity check, but the Content Security Policy allows only those package paths) and the model from huggingface.co. After that the model works offline from the browser cache.
 
 | Model | Download | Notes |
 |---|---|---|

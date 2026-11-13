@@ -4,25 +4,29 @@ name: Release
 #   Web (zip + installable PWA)        Windows (installer x64/arm64, portable x64)
 #   macOS (universal .dmg/.zip)        Linux x64/arm64/armv7l (AppImage, .deb): desktop Linux,
 #   iOS (unsigned .ipa)                Raspberry Pi OS (arm64, armhf) and ChromeOS (Linux apps)
-#   Android (APK, AAB)                 ChromeOS can also run the APK or install the web app.
-# Run it from the Actions tab (any branch: published as a prerelease v<version>-build.<run>),
-# push a tag v<version>, or push a commit whose message contains [release] (prerelease).
-# The last option exists for environments that may push branches but not tags.
+#   Android (signed APK, AAB)          ChromeOS can also run the APK or install the web app.
+# Triggers (docs/BUILD.md, "Releases"):
+#   - push a tag v<version> (must equal package.json's version; v<version>-<suffix> is a prerelease);
+#   - run it from the Actions tab on the default branch: with a tag (e.g. v0.5.0, for sessions that
+#     can push branches but not tags), or empty for a prerelease v<version>-build.<run>;
+#   - push a commit whose message contains [release] to main (prerelease v<version>-build.<run>).
+# Publishing waits for the "release" environment (create it in Settings ▸ Environments with
+# required reviewers). Only an official tag v<version> becomes the latest release.
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to create, e.g. v0.5.0 (for sessions that can push branches but not tags). Empty: v<version>-build.<run>'
+        description: 'Release tag to create, e.g. v0.5.0 (must match package.json). Empty: prerelease v<version>-build.<run>'
         type: string
         default: ''
       prerelease:
-        description: 'Mark the release as a prerelease'
+        description: 'Mark an official tag (v<version>) as a prerelease'
         type: boolean
         default: true
   push:
     tags: ['v*']
-    branches: ['**']
+    branches: [main]
 
 permissions:
   contents: read
@@ -32,38 +36,95 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  meta:
+    name: Check version and tag
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[release]'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      official: ${{ steps.meta.outputs.official }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      latest: ${{ steps.meta.outputs.latest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=$(node -p "require('./package.json').version")
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then TAG="${GITHUB_REF#refs/tags/}"
+          elif [[ -n "$INPUT_TAG" ]]; then TAG="$INPUT_TAG"
+          else TAG="v$V-build.$GITHUB_RUN_NUMBER"; fi
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$TAG' is not v<major>.<minor>.<patch>[-suffix]"; exit 1
+          fi
+          if [[ "$TAG" == "v$V" ]]; then OFFICIAL=true
+          elif [[ "$TAG" == "v$V-"* ]]; then OFFICIAL=false
+          else echo "::error::Tag $TAG does not match package.json version $V (expected v$V or v$V-<suffix>)"; exit 1; fi
+          # Official tags: the checkbox on manual runs, never on pushed tags. Everything else: prerelease.
+          PRE=true
+          if [[ "$OFFICIAL" == true ]]; then
+            if [[ "$EVENT" == workflow_dispatch ]]; then PRE="$INPUT_PRERELEASE"; else PRE=false; fi
+          fi
+          LATEST=false
+          [[ "$OFFICIAL" == true && "$PRE" != true ]] && LATEST=true
+          # A re-run of this run may finish a release it started; anything else must not replace one.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 && [[ "$GITHUB_RUN_ATTEMPT" == 1 ]]; then
+            echo "::error::Release $TAG already exists"; exit 1
+          fi
+          {
+            echo "version=$V"; echo "tag=$TAG"; echo "official=$OFFICIAL"; echo "prerelease=$PRE"; echo "latest=$LATEST"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release $TAG (version $V, official $OFFICIAL, prerelease $PRE, latest $LATEST)"
+
   web:
     name: Web
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[release]')
+    needs: meta
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    outputs:
-      version: ${{ steps.v.outputs.version }}
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: npm }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version-file: .nvmrc, cache: npm }
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
-      - id: v
-        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
       - name: Package
         run: |
           mkdir -p out
-          (cd dist && zip -qr "../out/QuillPen-${{ steps.v.outputs.version }}-web.zip" .)
-      - uses: actions/upload-artifact@v4
+          (cd dist && zip -qr "../out/Annes-Pen-$VERSION-web.zip" .)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: QuillPen-web
+          name: Annes-Pen-web
           path: out/*.zip
           if-no-files-found: error
 
   desktop:
     name: Desktop (${{ matrix.name }})
-    needs: web
+    needs: [meta, web]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -72,9 +133,11 @@ jobs:
           - { name: Windows, os: windows-latest, args: --win }
           - { name: macOS, os: macos-latest, args: --mac }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: npm }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version-file: .nvmrc, cache: npm }
       - run: npm ci
       - run: npm run build
       - run: node scripts/prepare-desktop.mjs
@@ -87,10 +150,11 @@ jobs:
         shell: bash
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: npx electron-builder --config electron-builder.config.cjs ${{ matrix.args }} --publish never
-      - uses: actions/upload-artifact@v4
+          TARGET: ${{ matrix.args }}
+        run: npx electron-builder --config electron-builder.config.cjs "$TARGET" --publish never
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: QuillPen-desktop-${{ matrix.name }}
+          name: Annes-Pen-desktop-${{ matrix.name }}
           path: |
             release/*.exe
             release/*.dmg
@@ -101,84 +165,88 @@ jobs:
 
   ios:
     name: iOS (unsigned)
-    needs: web
+    needs: [meta, web]
     runs-on: macos-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: npm }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version-file: .nvmrc, cache: npm }
       - run: npm ci
       - run: npm run build
       - run: npx cap sync ios
       - name: Build
         run: |
-          V='${{ needs.web.outputs.version }}'
           xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build/ios \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            MARKETING_VERSION="$V" CURRENT_PROJECT_VERSION="${{ github.run_number }}" build
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
           mkdir -p out/Payload
           cp -R build/ios/Build/Products/Release-iphoneos/App.app out/Payload/
-          (cd out && zip -qry "QuillPen-$V-ios-unsigned.ipa" Payload && rm -rf Payload)
-      - uses: actions/upload-artifact@v4
+          (cd out && zip -qry "Annes-Pen-$VERSION-ios-unsigned.ipa" Payload && rm -rf Payload)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: QuillPen-ios
+          name: Annes-Pen-ios
           path: out/*.ipa
           if-no-files-found: error
 
   android:
     name: Android
-    needs: web
-    uses: ./.github/workflows/android.yml
+    needs: [meta, web]
+    uses: ./.github/workflows/android-build.yml
     with:
-      prerelease: false
+      signed: true
+      official: ${{ needs.meta.outputs.official == 'true' }}
+    secrets: inherit
     permissions:
-      contents: write
+      contents: read
 
   publish:
     name: Publish release
-    needs: [web, desktop, ios, android]
+    needs: [meta, web, desktop, ios, android]
     # Publish whatever built, as long as the tested web build did; the notes list any failures.
-    if: ${{ !cancelled() && needs.web.result == 'success' }}
+    if: ${{ !cancelled() && needs.meta.result == 'success' && needs.web.result == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
     permissions:
       contents: write
+    env:
+      TAG: ${{ needs.meta.outputs.tag }}
+      RESULT_DESKTOP: ${{ needs.desktop.result }}
+      RESULT_IOS: ${{ needs.ios.result }}
+      RESULT_ANDROID: ${{ needs.android.result }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: QuillPen-*
+          pattern: Annes-Pen-*
           path: out
           merge-multiple: true
       - name: Checksums
         run: |
           cd out
           ls -la
-          sha256sum QuillPen-* > SHA256SUMS.txt
+          sha256sum Annes-Pen-* > SHA256SUMS.txt
       - id: meta
         run: |
-          V='${{ needs.web.outputs.version }}'
-          if [[ -n "${{ inputs.tag }}" ]]; then TAG="${{ inputs.tag }}"
-          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then TAG="${GITHUB_REF#refs/tags/}"; else TAG="v$V-build.${{ github.run_number }}"; fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          # Tags: prerelease when the version has a suffix (v1.0.0-beta.1). Manual runs: the checkbox.
-          # [release] commits: always a prerelease.
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then [[ "$TAG" == *-* ]] && PRE=true || PRE=false
-          elif [[ "${{ github.event_name }}" == workflow_dispatch ]]; then PRE='${{ inputs.prerelease }}'
-          else PRE=true; fi
-          echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
           FAILED=""
-          for j in "desktop:${{ needs.desktop.result }}" "ios:${{ needs.ios.result }}" "android:${{ needs.android.result }}"; do
+          for j in "desktop:$RESULT_DESKTOP" "ios:$RESULT_IOS" "android:$RESULT_ANDROID"; do
             [[ "${j#*:}" == success ]] || FAILED="$FAILED ${j%%:*}"
           done
           echo "failed=$FAILED" >> "$GITHUB_OUTPUT"
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
+          tag_name: ${{ needs.meta.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: Anne's Pen ${{ steps.meta.outputs.tag }}
-          prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
-          make_latest: ${{ steps.meta.outputs.prerelease != 'true' }}
+          name: Anne's Pen ${{ needs.meta.outputs.tag }}
+          prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.meta.outputs.latest == 'true' }}
           generate_release_notes: true
           body: |
             Built from `${{ github.ref_name }}` at ${{ github.sha }}. Installation for each platform: docs/INSTALL.md.
@@ -196,5 +264,5 @@ jobs:
 
             ${{ steps.meta.outputs.failed && format('**Not in this release (build failed):**{0}', steps.meta.outputs.failed) || '' }}
           files: |
-            out/QuillPen-*
+            out/Annes-Pen-*
             out/SHA256SUMS.txt

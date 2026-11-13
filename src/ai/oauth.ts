@@ -90,7 +90,7 @@ export async function startOpenRouterSignIn(timeoutMs = 10 * 60 * 1000): Promise
   let callback: string;
   if (isNative()) {
     const path = `/callback/${nonce}`;
-    const port = await startOAuthLoopback(timeoutMs, '<!doctype html><meta name="viewport" content="width=device-width"><body style="font:16px system-ui;padding:24px;text-align:center"><h2>Signed in</h2><p>Anne\'s Pen received your OpenRouter key. You can close this tab and return to QuillPen.</p></body>', path);
+    const port = await startOAuthLoopback(timeoutMs, '<!doctype html><meta name="viewport" content="width=device-width"><body style="font:16px system-ui;padding:24px;text-align:center"><h2>Signed in</h2><p>Anne\'s Pen received your OpenRouter key. You can close this tab and return to Anne\'s Pen.</p></body>', path);
     callback = `http://127.0.0.1:${port}${path}`;
     const h = await onOAuthCallback((url) => {
       if (!isOurCallback(url, path)) return;

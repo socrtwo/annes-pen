@@ -1,21 +1,21 @@
 # Installing Anne's Pen
 
-Every release on the [Releases](https://github.com/socrtwo/QuillPen/releases) page has a build for each platform, plus `SHA256SUMS.txt` to check the downloads. The builds are not signed with paid store certificates, so each system asks once whether to trust them. The steps are below.
+Every release on the [Releases](https://github.com/socrtwo/annes-pen/releases) page has a build for each platform, plus `SHA256SUMS.txt` to check the downloads. The builds are not signed with paid store certificates, so each system asks once whether to trust them. The steps are below.
 
 | Platform | File | Notes |
 |---|---|---|
-| Windows 10/11 (x64) | `QuillPen-<v>-windows-x64-setup.exe` | Installer; per-user, no admin rights needed |
-| Windows on ARM | `QuillPen-<v>-windows-arm64-setup.exe` | |
-| Windows, either | `QuillPen-<v>-windows-setup.exe` | One installer for x64 and ARM (twice the size) |
-| Windows, no install | `QuillPen-<v>-windows-portable.exe` | Runs from a USB stick or any folder |
-| macOS 11+ | `QuillPen-<v>-mac-universal.dmg` (or `.zip`) | One app for Apple silicon and Intel |
-| Linux x64 | `QuillPen-<v>-linux-x86_64.AppImage` or `QuillPen-<v>-linux-amd64.deb` | |
-| Raspberry Pi OS 64-bit (Pi 3/4/5) | `QuillPen-<v>-linux-arm64.deb` or `QuillPen-<v>-linux-arm64.AppImage` | |
-| Raspberry Pi OS 32-bit | `QuillPen-<v>-linux-armv7l.deb` | Pi 2 and later. A Pi 4 or 5 runs it much faster. |
+| Windows 10/11 (x64) | `Annes-Pen-<v>-windows-x64-setup.exe` | Installer; per-user, no admin rights needed |
+| Windows on ARM | `Annes-Pen-<v>-windows-arm64-setup.exe` | |
+| Windows, either | `Annes-Pen-<v>-windows-setup.exe` | One installer for x64 and ARM (twice the size) |
+| Windows, no install | `Annes-Pen-<v>-windows-portable.exe` | Runs from a USB stick or any folder |
+| macOS 11+ | `Annes-Pen-<v>-mac-universal.dmg` (or `.zip`) | One app for Apple silicon and Intel |
+| Linux x64 | `Annes-Pen-<v>-linux-x86_64.AppImage` or `Annes-Pen-<v>-linux-amd64.deb` | |
+| Raspberry Pi OS 64-bit (Pi 3/4/5) | `Annes-Pen-<v>-linux-arm64.deb` or `Annes-Pen-<v>-linux-arm64.AppImage` | |
+| Raspberry Pi OS 32-bit | `Annes-Pen-<v>-linux-armv7l.deb` | Pi 2 and later. A Pi 4 or 5 runs it much faster. |
 | ChromeOS | APK, Linux `.deb`, or the web app | See below |
-| Android 7+ | `QuillPen-<v>.apk` | |
-| iOS / iPadOS 15+ | `QuillPen-<v>-ios-unsigned.ipa` | Must be signed with your Apple ID; see below |
-| Web | `QuillPen-<v>-web.zip` | Static files for any web server |
+| Android 7+ | `Annes-Pen-<v>.apk` | |
+| iOS / iPadOS 15+ | `Annes-Pen-<v>-ios-unsigned.ipa` | Must be signed with your Apple ID; see below |
+| Web | `Annes-Pen-<v>-web.zip` | Static files for any web server |
 
 ## Windows
 
@@ -34,7 +34,7 @@ xattr -dr com.apple.quarantine "/Applications/Anne's Pen.app"
 `.deb` (Debian, Ubuntu, Mint, Raspberry Pi OS):
 
 ```bash
-sudo apt install ./QuillPen-<v>-linux-arm64.deb     # or -amd64 / -armv7l
+sudo apt install ./Annes-Pen-<v>-linux-arm64.deb     # or -amd64 / -armv7l
 ```
 
 Anne's Pen then appears in the Office menu. To remove it: `sudo apt remove quillpen`.
@@ -42,8 +42,8 @@ Anne's Pen then appears in the Office menu. To remove it: `sudo apt remove quill
 AppImage (any distribution, no install):
 
 ```bash
-chmod +x QuillPen-<v>-linux-x86_64.AppImage
-./QuillPen-<v>-linux-x86_64.AppImage
+chmod +x Annes-Pen-<v>-linux-x86_64.AppImage
+./Annes-Pen-<v>-linux-x86_64.AppImage
 ```
 
 Some distributions need `libfuse2` (`sudo apt install libfuse2`) for AppImages. On Ubuntu 24.04 and later, AppImages may also need `--no-sandbox` because of an AppArmor restriction. The `.deb` does not have that problem.
@@ -71,14 +71,36 @@ On iOS, **Save** writes to **Files ▸ On My iPhone ▸ Anne's Pen**, and **Open
 
 ## Web
 
-Unzip `QuillPen-<v>-web.zip` onto any static web host (GitHub Pages, Netlify, an Apache or nginx folder). Served over HTTPS, the app works offline after the first visit and can be installed as an app from Chrome or Edge. It does not need a server-side component.
+Unzip `Annes-Pen-<v>-web.zip` (its files are at the top level, with no folder) onto any static web host (GitHub Pages, Netlify, an Apache or nginx folder). Served over HTTPS, the app works offline after the first visit and can be installed as an app from Chrome or Edge. It does not need a server-side component.
 
 To try it locally:
 
 ```bash
-npx serve QuillPen-<v>-web
+unzip -d annes-pen-web Annes-Pen-<v>-web.zip
+npx serve annes-pen-web
 ```
+
+## Coming from QuillForge
+
+Anne's Pen was named QuillForge. Its `.qfd` and `.qfde` documents open in Anne's Pen.
+
+- **Windows, macOS, Linux:** the desktop app copies QuillForge's settings, drafts, granted files and
+  stored keys on its first start; nothing to do.
+- **Web:** a copy served from the same address keeps its settings and drafts.
+- **Android and iOS:** Anne's Pen is a new app with its own app ID, so it starts empty and the old
+  QuillForge app stays installed next to it. To move over:
+  1. In QuillForge, save every open document and draft you want to keep to a file (**File ▸ Save As**,
+     somewhere you can reach from other apps, for example *Documents* or Google Drive).
+  2. In QuillForge, open **File ▸ Options ▸ Export / Import All Settings…** (or **Backstage ▸ Options ▸
+     Export / Import Settings…**), choose **Copy**, and paste the text somewhere safe (a note or a file).
+     It holds the Quick Access Bar, custom tabs, shortcuts, macros, building blocks, AutoCorrect and
+     preferences.
+  3. Install Anne's Pen, open the same dialog, paste the text and choose **Import**.
+  4. Open the saved documents in Anne's Pen (**File ▸ Open**, or *Open with* from a file manager).
+  5. AI keys are not part of the settings text: enter them again in **AI ▸ AI Settings**. Downloaded
+     spelling dictionaries download again from **Review ▸ Spelling Dictionaries**.
+  6. Uninstall QuillForge when everything is there.
 
 ## Spelling dictionaries for other languages
 
-The app includes English (American, British, Canadian, Australian). **Review ▸ Spelling Dictionaries** downloads any of 90+ other languages when you need them; see the [README](../README.md#spelling-in-other-languages).
+The app includes English (American, British, Canadian, Australian). **Review ▸ Spelling Dictionaries** downloads any of 88 other languages and varieties when you need them; see the [README](../README.md#spelling-in-other-languages).

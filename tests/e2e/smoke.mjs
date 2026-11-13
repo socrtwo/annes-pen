@@ -1,11 +1,10 @@
 // Smoke test: loads the built app in Chromium (phone + desktop), exercises core commands, screenshots.
-import { chromium } from 'playwright';
+import { launchChromium } from './browser.mjs';
 import fs from 'node:fs';
 const URL = process.env.QF_URL || 'http://localhost:4173/';
 const OUT = process.env.QF_OUT || 'test-results';
 fs.mkdirSync(OUT, { recursive: true });
-const exe = ['/opt/pw-browsers/chromium-1194/chrome-linux/chrome', '/opt/pw-browsers/chromium'].find((p) => fs.existsSync(p) && fs.statSync(p).isFile());
-const browser = await chromium.launch(exe ? { executablePath: exe } : {});
+const browser = await launchChromium();
 let failures = 0;
 async function run(name, viewport, fn) {
   const ctx = await browser.newContext({ viewport, deviceScaleFactor: 1, hasTouch: viewport.width < 700 });

@@ -114,7 +114,7 @@ final class AiSupport {
             this.server = new ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"));
             this.server.setSoTimeout(1000);
             this.deadline = System.currentTimeMillis() + Math.max(10_000L, timeoutMs);
-            this.html = html != null ? html : "<!doctype html><body><p>You can return to QuillPen.</p></body>";
+            this.html = html != null ? html : "<!doctype html><body><p>You can return to Anne&#39;s Pen.</p></body>";
             this.expectedPath = expectedPath;
             this.callback = callback;
         }

@@ -20,7 +20,7 @@ writeFileSync(join(out, 'package.json'), JSON.stringify({
   productName: 'Anne\'s Pen',
   version: pkg.version,
   description: pkg.description,
-  homepage: 'https://github.com/socrtwo/QuillPen',
+  homepage: 'https://github.com/socrtwo/annes-pen',
   author: { name: 'socrtwo', email: 'socrtwo@users.noreply.github.com' },
   license: pkg.license,
   main: 'electron/main.cjs',

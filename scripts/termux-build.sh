@@ -2,18 +2,19 @@
 # Build the Anne's Pen Android APK on an Android device with Termux (https://termux.dev, the
 # F-Droid or GitHub build; the Play Store build is outdated).
 #
-#   curl -fsSLO https://raw.githubusercontent.com/socrtwo/QuillPen/main/scripts/termux-build.sh
+#   curl -fsSLO https://raw.githubusercontent.com/socrtwo/annes-pen/main/scripts/termux-build.sh
 #   bash termux-build.sh            # first run installs everything (about 2.5 GB, 20-40 minutes)
 #   bash termux-build.sh --web      # only the web build (dist/), no Android SDK needed
 #
-# Environment overrides: QF_DIR (checkout, default ~/QuillPen), QF_BRANCH (default main),
+# Environment overrides: QF_DIR (checkout, default ~/annes-pen, or ~/QuillPen if an older run made it), QF_BRANCH (default main),
 # ANDROID_HOME (default ~/android-sdk), QF_HEAP (Gradle heap, default 1536m).
 #
 # Google's Android SDK has no ARM build of aapt2, so the build uses Termux's own aapt2 via
 # android.aapt2FromMavenOverride. Needs a 64-bit ARM device with about 4 GB of RAM.
 set -euo pipefail
 
-QF_DIR="${QF_DIR:-$HOME/QuillPen}"
+if [[ -z "${QF_DIR:-}" && ! -d "$HOME/annes-pen" && -d "$HOME/QuillPen/.git" ]]; then QF_DIR="$HOME/QuillPen"; fi # rename:keep — checkout made before the rename
+QF_DIR="${QF_DIR:-$HOME/annes-pen}"
 QF_BRANCH="${QF_BRANCH:-main}"
 ANDROID_HOME="${ANDROID_HOME:-$HOME/android-sdk}"
 QF_HEAP="${QF_HEAP:-1536m}"
@@ -35,7 +36,7 @@ if [[ -d "$QF_DIR/.git" ]]; then
   git -C "$QF_DIR" fetch --depth 1 origin "$QF_BRANCH"
   git -C "$QF_DIR" checkout -q FETCH_HEAD
 else
-  git clone --depth 1 --branch "$QF_BRANCH" https://github.com/socrtwo/QuillPen "$QF_DIR"
+  git clone --depth 1 --branch "$QF_BRANCH" https://github.com/socrtwo/annes-pen "$QF_DIR"
 fi
 cd "$QF_DIR"
 
@@ -74,6 +75,8 @@ echo "sdk.dir=$ANDROID_HOME" > android/local.properties
 say "Building the APK (Gradle downloads itself the first time)"
 cd android
 chmod +x gradlew
+# Without a release keystore (ANDROID_KEYSTORE_PATH etc., docs/ANDROID.md) sign with the debug key.
+if [[ -z "${ANDROID_KEYSTORE_PATH:-}" ]]; then export ALLOW_DEBUG_SIGNING=true; fi
 ./gradlew --no-daemon \
   -Dorg.gradle.jvmargs="-Xmx$QF_HEAP -Dfile.encoding=UTF-8" \
   -Pandroid.aapt2FromMavenOverride="$PREFIX/bin/aapt2" \
@@ -81,7 +84,7 @@ chmod +x gradlew
 
 VERSION=$(node -p "require('../package.json').version")
 APK=$(ls app/build/outputs/apk/release/*.apk | head -n 1)
-OUT="$QF_DIR/QuillPen-$VERSION.apk"
+OUT="$QF_DIR/Annes-Pen-$VERSION.apk"
 cp "$APK" "$OUT"
 if [[ -d "$HOME/storage/downloads" ]]; then
   cp "$OUT" "$HOME/storage/downloads/"

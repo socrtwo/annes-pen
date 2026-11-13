@@ -3,6 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+  <!-- Keep in step with the CSP header in electron/main.cjs. 'unsafe-eval' is for user macros
+       (Developer tab); the jsDelivr paths (pinned versions, src/ai/local.ts) and wasm are for the
+       optional on-device AI model; http to localhost is for Ollama and LM Studio. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval' blob: https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0/ https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0-dev.20260416-b7804b056c/dist/ https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.0-dev.20251116-b39e144322/dist/; worker-src 'self' blob:; connect-src 'self' https: http://localhost:* http://127.0.0.1:* data: blob:; img-src 'self' data: blob: https:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-src 'none'" />
   <meta name="color-scheme" content="light dark" />
   <meta name="theme-color" content="#2b4a7e" />
   <link rel="icon" href="favicon.svg" type="image/svg+xml" />

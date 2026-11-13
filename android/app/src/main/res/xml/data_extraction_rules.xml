@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+ (allowBackup="false" covers older versions and adb backup).
+     No cloud backup of the WebView's storage (drafts, settings) or the Keystore-encrypted secrets.
+     A device-to-device transfer keeps drafts and settings; the secrets stay behind because their
+     Keystore key does not move to the new device. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" path="app_webview/" />
+        <exclude domain="sharedpref" path="quillpen.secure.xml" />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="quillpen.secure.xml" />
+    </device-transfer>
+</data-extraction-rules>

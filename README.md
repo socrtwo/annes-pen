@@ -1,6 +1,6 @@
 # Anne's Pen
 
-*Part of the Anne's Office suite: **Anne's Pen** (documents), [Anne's Grid](https://github.com/socrtwo/QuillGrid) (spreadsheets), [Anne's Post](https://github.com/socrtwo/QuillPost) (email) and [Anne's Stage](https://github.com/socrtwo/QuillStage) (presentations). Formerly named QuillForge; its .qfd/.qfde documents, settings and drafts carry over.*
+*Part of the Anne's Office suite: **Anne's Pen** (documents), [Anne's Grid](https://github.com/socrtwo/QuillGrid) (spreadsheets), [Anne's Post](https://github.com/socrtwo/QuillPost) (email) and [Anne's Stage](https://github.com/socrtwo/QuillStage) (presentations). Formerly named QuillForge: its .qfd/.qfde documents open, and the desktop and web apps keep its settings and drafts. On Android and iOS Anne's Pen installs as a new app; [docs/INSTALL.md](docs/INSTALL.md#coming-from-quillforge) shows how to move documents and settings over.*
 
 An original, open-source word processor for Android (and the web) whose goal is simple: **no missing commands**. Every feature is a command, and every command can be put on the Quick Access Bar, on your own tab, on a keyboard shortcut, or in a macro, which is the full-library customization that mobile and online office apps leave out.
 
@@ -25,7 +25,7 @@ Each [release](../../releases) has builds for:
 
 [docs/INSTALL.md](docs/INSTALL.md) has the steps for each. To build it yourself, including the APK on the phone itself with Termux, see [docs/BUILD.md](docs/BUILD.md).
 
-On Android, Anne's Pen registers for *Open with* and *Share to* on .docx, .doc, .odt, .rtf, .md, .txt, .html and .epub files. It uses the Android system file picker, so files on the device, SD card, Google Drive, Dropbox and similar providers all work. **Save** writes back to the same file.
+On Android, Anne's Pen registers for *Share to* on .docx, .doc, .odt, .rtf, .md, .txt, .html and .epub files (and plain text), and for *Open with* on those plus .qpd, WordPerfect, Works, Write, Lotus, Hangul, MacWrite, ClarisWorks, WordStar, XyWrite, .eml, .msg and MHTML files. It uses the Android system file picker, so files on the device, SD card, Google Drive, Dropbox and similar providers all work. **Save** writes back to the same file.
 
 ## Features
 
@@ -35,7 +35,7 @@ On Android, Anne's Pen registers for *Open with* and *Share to* on .docx, .doc, 
 - OpenType ligatures, number forms, kerning and stylistic sets;
 - text effects, character borders and shading, phonetic guides.
 
-Paragraph controls cover alignment, indents, spacing, line rules, keep-with-next, keep-lines-together, page break before, widow/orphan control, borders and shading, tab stops and drop caps. Lists can be bulleted (custom bullets), numbered (many formats), multilevel outline, or checklists. A style system offers about 70 built-in styles, style sets (Classic, Modern, Elegant, Book, Manuscript, Academic, Technical, Newsletter, Typewriter) and themes. You can create, modify and inspect styles.
+Paragraph controls cover alignment, indents, spacing, line rules, keep-with-next, keep-lines-together, page break before, widow/orphan control, borders and shading, tab stops and drop caps. Lists can be bulleted (custom bullets), numbered (many formats), multilevel outline, or checklists. A style system offers 78 built-in styles, 10 style sets (Anne's Pen, Classic, Modern, Elegant, Book, Manuscript, Academic, Technical, Newsletter, Typewriter) and themes. You can create, modify and inspect styles.
 
 **Pages.** Print Layout shows real pages with:
 - automatic pagination that splits paragraphs across pages and honors widow/orphan and keep rules;
@@ -101,13 +101,13 @@ Ireland, India, South Africa and other countries that follow British spelling us
 Providers:
 - An on-device model (free, private, offline after one download).
 - Chrome's built-in model.
-- Free tiers: OpenRouter, Gemini, Groq, Mistral, Cerebras, SambaNova, Z.ai, NVIDIA, Cloudflare.
+- Free tiers: OpenRouter, Gemini, Groq, Mistral, Cerebras, SambaNova, Z.ai, NVIDIA, Cloudflare; free trial keys: Cohere, Fireworks, Qwen.
 - Ollama or LM Studio on your computer.
-- Paid keys: OpenAI, Anthropic, DeepSeek, xAI, Perplexity, Together, Fireworks, Hugging Face, Moonshot, Qwen, Azure, Bedrock, or any OpenAI-compatible service.
+- Paid keys: OpenAI, Anthropic, DeepSeek, xAI, Perplexity, Together, Fireworks, Hugging Face, Moonshot, Qwen, Cohere, Azure, Bedrock, or any OpenAI-compatible service.
 
-Keys are stored encrypted on the device (Android Keystore), and nothing is sent until you use an AI command.
+Keys are stored encrypted on the device (Android Keystore; on desktops the system keychain, or unencrypted where Linux has none), and nothing is sent until you use an AI command.
 
-## Known limitations (0.3)
+## Known limitations
 
 - Pagination splits paragraphs but does not split tables or images across pages. A block taller than a page overflows it. Section breaks do not change page size or orientation mid-document; one page setup applies to the whole document.
 - Footnote, endnote and comment bodies are plain text.
@@ -133,9 +133,9 @@ npm run desktop         # run the desktop app (Electron); desktop:dist builds in
 npm run ios:sync        # web build into the Xcode project (ios/)
 ```
 
-CI (`.github/workflows/android.yml`) type-checks, tests, builds the web app, and produces an APK and AAB on every push. The **Release** workflow (`.github/workflows/release.yml`) builds every platform and publishes them together; run it from the Actions tab or push a tag `v*`. See [docs/BUILD.md](docs/BUILD.md).
+CI type-checks, runs the unit and browser tests (`.github/workflows/ci.yml`) and builds a debug-signed APK and AAB (`.github/workflows/android.yml`) on every push. The **Release** workflow (`.github/workflows/release.yml`) builds every platform and publishes them together: push a tag `v<version>` matching `package.json`, or run it from the Actions tab on `main`. See [docs/BUILD.md](docs/BUILD.md#releases).
 
-Browser checks: `npm run build && npx vite preview --port 4173`, then `node tests/e2e/smoke.mjs`, `node tests/e2e/all-commands.mjs` (executes every command and menu variant), `node tests/e2e/visual.mjs`, `node tests/e2e/io.mjs`, `node tests/e2e/ai.mjs` (AI features against a mock OpenAI/Anthropic/Gemini server) and `node tests/e2e/dictionaries.mjs` (downloads a real dictionary). The desktop app: `xvfb-run -a node tests/e2e/desktop.mjs`. Layout on phones (system bars, keyboard, 320–915 px): `npm run e2e:layout` (starts its own dev server).
+Browser checks: `npm run e2e:all` builds, serves the build with `vite preview` on a free port and runs the smoke, UI-hardening, all-commands (every command and menu variant), io, visual and offline (PWA) tests. After a build, `npm run e2e:<name>` runs one of them, as well as `e2e:ai` (AI features against a mock OpenAI/Anthropic/Gemini server) and `e2e:dictionaries` (downloads a real dictionary). The desktop app: `xvfb-run -a node tests/e2e/desktop.mjs`. Layout on phones (system bars, keyboard, 320–915 px): `npm run e2e:layout` (starts its own dev server).
 
 Anne's Post, the suite's email app, can use this editor for message bodies: see [docs/EMBED.md](docs/EMBED.md).
 

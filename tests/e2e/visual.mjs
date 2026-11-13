@@ -1,9 +1,9 @@
 // Visual checks of layout features; writes screenshots to test-results/.
-import { chromium } from 'playwright';
+import { launchChromium } from './browser.mjs';
 import fs from 'node:fs';
 const URL = process.env.QF_URL || 'http://localhost:4173/';
-const exe = ['/opt/pw-browsers/chromium-1194/chrome-linux/chrome'].find((p) => fs.existsSync(p));
-const browser = await chromium.launch(exe ? { executablePath: exe } : {});
+const browser = await launchChromium();
+fs.mkdirSync('test-results', { recursive: true });
 const errors = [];
 async function open(viewport) {
   const page = await browser.newPage({ viewport });
@@ -44,3 +44,4 @@ await phone.waitForTimeout(400);
 await phone.screenshot({ path: 'test-results/visual-phone-nav.png' });
 console.log('errors:', errors);
 await browser.close();
+process.exit(errors.length ? 1 : 0);

@@ -63,7 +63,7 @@ const parts = [
 const sorted = [...seen.entries()].sort((a, b) => a[1].name.localeCompare(b[1].name));
 for (const [dir, pkg] of sorted) {
   const lic = typeof pkg.license === 'string' ? pkg.license : pkg.license?.type || (pkg.licenses || []).map((l) => l.type || l).join(' OR ') || 'see below';
-  parts.push(rule, `${pkg.name} ${pkg.version} - ${lic}`, repoUrl(pkg), rule, '', licenseText(dir) || `License: ${lic} (no license file in the package).`, '');
+  parts.push(rule, `${pkg.name} ${pkg.version} - ${lic}`, repoUrl(pkg), rule, '', licenseText(dir) || `License: ${lic}. The package ships no license file; its license is the one named in its\npackage.json ("license": "${lic}"), with the text and copyright notice at ${repoUrl(pkg) || 'its source repository'}.`, '');
 }
 mkdirSync(join(root, 'public'), { recursive: true });
 writeFileSync(join(root, 'public', 'third-party-notices.txt'), parts.join('\n'));

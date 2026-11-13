@@ -1,8 +1,7 @@
 // Round-trips a template document through every export/import format inside Chromium.
-import { chromium } from 'playwright';
+import { launchChromium } from './browser.mjs';
 import fs from 'node:fs';
-const exe = ['/opt/pw-browsers/chromium-1194/chrome-linux/chrome'].find((p) => fs.existsSync(p));
-const browser = await chromium.launch(exe ? { executablePath: exe } : {});
+const browser = await launchChromium();
 const page = await browser.newPage();
 const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));
@@ -30,3 +29,4 @@ const res = await page.evaluate(async () => {
 console.log(res.join('\n'));
 console.log('errors', errors);
 await browser.close();
+process.exit(errors.length || res.some((l) => l.includes(': ERROR ')) ? 1 : 0);

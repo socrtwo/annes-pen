@@ -8,10 +8,20 @@ module.exports = {
   appId: 'io.github.socrtwo.quillpen',
   productName: 'Anne\'s Pen',
   executableName: 'QuillPen', // the binary keeps its old name; the product (display) name is Anne's Pen
-  copyright: 'Anne\'s Pen contributors, MIT License',
+  copyright: 'Copyright (c) 2026 Paul D Pruitt, MIT License',
   directories: { app: 'build/desktop-app', output: 'release', buildResources: 'resources' },
-  artifactName: 'QuillPen-${version}-${os}-${arch}.${ext}',
+  artifactName: 'Annes-Pen-${version}-${os}-${arch}.${ext}',
   asar: true,
+  // Electron fuses: no ELECTRON_RUN_AS_NODE, NODE_OPTIONS or --inspect, and only the packaged
+  // (integrity-checked on Windows and macOS) app.asar runs.
+  electronFuses: {
+    runAsNode: false,
+    enableNodeOptionsEnvironmentVariable: false,
+    enableNodeCliInspectArguments: false,
+    enableEmbeddedAsarIntegrityValidation: true,
+    onlyLoadAppFromAsar: true,
+    grantFileProtocolExtraPrivileges: false,
+  },
   // Everything the app needs is bundled into dist/ by Vite; ship no node_modules.
   files: ['dist/**/*', 'electron/**/*', 'package.json', '!**/node_modules/**'],
   icon: 'resources/icon-1024.png',
@@ -35,8 +45,8 @@ module.exports = {
   win: {
     target: [{ target: 'nsis', arch: ['x64', 'arm64'] }, { target: 'portable', arch: ['x64'] }],
   },
-  nsis: { oneClick: false, perMachine: false, allowToChangeInstallationDirectory: true, artifactName: 'QuillPen-${version}-windows-${arch}-setup.${ext}' },
-  portable: { artifactName: 'QuillPen-${version}-windows-portable.${ext}' },
+  nsis: { oneClick: false, perMachine: false, allowToChangeInstallationDirectory: true, artifactName: 'Annes-Pen-${version}-windows-${arch}-setup.${ext}' },
+  portable: { artifactName: 'Annes-Pen-${version}-windows-portable.${ext}' },
   mac: {
     target: [{ target: 'dmg', arch: ['universal'] }, { target: 'zip', arch: ['universal'] }],
     category: 'public.app-category.productivity',
