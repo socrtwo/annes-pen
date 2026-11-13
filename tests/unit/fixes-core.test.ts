@@ -320,7 +320,8 @@ describe('app: opening a document with fields (8)', () => {
 });
 
 describe('setup: word completion keys (9)', () => {
-  for (const k of ['Tab', 'Enter']) {
+  // Enter no longer accepts (it would glue the word onto the next line); see fix-d1b.test.ts.
+  for (const k of ['Tab']) {
     it(`${k} accepts the suggestion`, () => {
       const d = doc(P('extraordinary things happen. ext'));
       const view = realView(d, d.content.size - 1);

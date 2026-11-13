@@ -4,7 +4,7 @@ import type { EditorView, NodeView, NodeViewConstructor } from 'prosemirror-view
 import { NodeSelection } from 'prosemirror-state';
 import katex from 'katex';
 import { sanitizeGeneratedHtml, escHtml } from '../util/sanitize';
-import { blockChangeDom } from './schema';
+import { blockChangeDom, imageStyle, safeImageSrc } from './schema';
 
 /** Show a block-level tracked change (Compare) on a node view's own DOM. */
 function showChange(dom: HTMLElement, node: PMNode): void {
@@ -64,6 +64,8 @@ class ImageView implements NodeView {
   dom: HTMLElement;
   img: HTMLImageElement;
   handles: HTMLElement[] = [];
+  /** Removes the window listeners of a resize or rotate drag in progress. */
+  private endDrag: (() => void) | null = null;
   constructor(private node: PMNode, private view: EditorView, private getPos: () => number | undefined, private hooks: NodeViewHooks) {
     this.dom = document.createElement('span');
     this.dom.className = 'qf-imgwrap';
@@ -86,28 +88,10 @@ class ImageView implements NodeView {
   }
   render() {
     const a = this.node.attrs;
-    this.img.src = a.src;
+    this.img.src = safeImageSrc(a.src);
     this.img.alt = a.alt || '';
     if (a.title) this.img.title = a.title;
-    const s: string[] = [];
-    if (a.width) s.push(`width:${a.width}pt`);
-    if (a.height) s.push(`height:${a.height}pt`);
-    const tr: string[] = [];
-    if (a.rotate) tr.push(`rotate(${a.rotate}deg)`);
-    if (a.flipH) tr.push('scaleX(-1)');
-    if (a.flipV) tr.push('scaleY(-1)');
-    if (tr.length) s.push(`transform:${tr.join(' ')}`);
-    if (a.border) s.push(`border:${a.border}`);
-    if (a.filter) s.push(`filter:${a.filter}`);
-    if (a.opacity != null) s.push(`opacity:${a.opacity}`);
-    if (a.shadow) s.push('box-shadow:4px 4px 8px rgba(0,0,0,.4)');
-    if (a.crop) {
-      try {
-        const c = JSON.parse(a.crop);
-        s.push(`clip-path:inset(${c.t || 0}% ${c.r || 0}% ${c.b || 0}% ${c.l || 0}%)`);
-      } catch { /* */ }
-    }
-    this.img.style.cssText = s.join(';');
+    this.img.style.cssText = imageStyle(a, true).join(';');
     this.dom.setAttribute('data-wrap', a.wrap || 'inline');
   }
   startResize(e: PointerEvent, corner: string) {
@@ -125,8 +109,7 @@ class ImageView implements NodeView {
       this.img.style.height = (ev.shiftKey ? h0 + ((ev.clientY - startY) / z) * (corner.includes('n') ? -1 : 1) : w * ratio) + 'px';
     };
     const up = () => {
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
+      this.stopDrag();
       const pos = this.getPos();
       if (pos == null) return;
       const wpt = Math.round(this.img.offsetWidth * 0.75 * 10) / 10;
@@ -135,9 +118,23 @@ class ImageView implements NodeView {
       // The selection must point into the changed document, not the one before the resize.
       this.view.dispatch(tr.setSelection(NodeSelection.create(tr.doc, pos)));
     };
+    this.listen(move, up);
+  }
+  /** Track a drag on window; pointercancel or destroy ends it without committing. */
+  private listen(move: (e: PointerEvent) => void, up: () => void) {
+    this.stopDrag();
+    const cancel = () => { this.stopDrag(); this.render(); };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', cancel);
+    this.endDrag = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', cancel);
+    };
   }
+  private stopDrag() { this.endDrag?.(); this.endDrag = null; }
+  destroy() { this.stopDrag(); }
   startRotate(e: PointerEvent) {
     e.preventDefault(); e.stopPropagation();
     const r = this.img.getBoundingClientRect();
@@ -149,13 +146,11 @@ class ImageView implements NodeView {
       this.img.style.transform = `rotate(${angle}deg)`;
     };
     const up = () => {
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
+      this.stopDrag();
       const pos = this.getPos();
       if (pos != null) this.view.dispatch(this.view.state.tr.setNodeMarkup(pos, undefined, { ...this.node.attrs, rotate: ((angle % 360) + 360) % 360 }));
     };
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
+    this.listen(move, up);
   }
   update(node: PMNode) {
     if (node.type !== this.node.type) return false;
@@ -192,7 +187,7 @@ class ControlView implements NodeView {
     else if (a.kind === 'picture') text = '';
     this.dom.textContent = text;
     if (a.kind === 'picture') {
-      if (a.value) { const img = document.createElement('img'); img.src = a.value; img.style.maxWidth = '200pt'; this.dom.appendChild(img); }
+      if (a.value) { const img = document.createElement('img'); img.src = safeImageSrc(a.value); img.style.maxWidth = '200pt'; this.dom.appendChild(img); }
       else this.dom.textContent = '🖼 Click to insert picture';
     }
     this.dom.classList.toggle('qf-placeholder', !a.value && a.kind !== 'checkbox');

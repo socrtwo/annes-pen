@@ -15,7 +15,7 @@
  */
 import { Schema, type NodeSpec, type MarkSpec, type Node as PMNode, type Mark, type DOMOutputSpec } from 'prosemirror-model';
 import { tableNodes } from 'prosemirror-tables';
-import { sanitizeGeneratedHtml, isScriptUrl } from '../util/sanitize';
+import { sanitizeGeneratedHtml, isScriptUrl, safeColor, safeCssValue } from '../util/sanitize';
 import { cssString } from './styles';
 
 type Attrs = Record<string, any>;
@@ -25,6 +25,49 @@ const num = (v: string | null | undefined): number | null => {
   const n = parseFloat(v);
   return Number.isFinite(n) ? n : null;
 };
+
+// Render-time guards. Attrs reach toDOM straight from documents (.qpd JSON never goes through
+// parseDOM), so every value put into a style attribute must be a single plain declaration value.
+/** A CSS value with no ; : quotes, url() or comments, or ''. */
+export const cssv = (v: unknown): string => safeCssValue(v) ?? '';
+/** A colour (hex, rgb/hsl, named, or a var(--name) theme colour), or ''. */
+export const cssColor = (v: unknown): string => {
+  const s = String(v ?? '').trim();
+  return safeColor(s, '') || (/^var\(--[\w-]+\)$/.test(s) ? s : '');
+};
+/** A finite number, or null. */
+export const cssNum = (v: unknown): number | null => (v == null || v === '' || typeof v === 'boolean' || !Number.isFinite(Number(v)) ? null : Number(v));
+/** A CSS keyword such as solid or lower-roman, or ''. */
+const cssKw = (v: unknown): string => (/^[a-z][\w-]{0,40}$/i.test(String(v ?? '')) ? String(v) : '');
+/** Space-separated keywords (font-variant-numeric etc.), or ''. */
+const cssKws = (v: unknown): string => (/^[a-z][\w\s-]{0,80}$/i.test(String(v ?? '')) ? String(v).trim() : '');
+const FILTER_FN = /^(blur|brightness|contrast|grayscale|hue-rotate|invert|opacity|saturate|sepia|drop-shadow)$/i;
+/** A CSS filter list built only from filter functions with plain arguments, or ''. */
+export function cssFilter(v: unknown): string {
+  const s = String(v ?? '').trim();
+  if (!s || s.length > 300 || !/^[\w\s.,%()#+-]+$/.test(s)) return '';
+  for (const m of s.matchAll(/([\w-]*)\s*\(/g)) if (!FILTER_FN.test(m[1]) && !/^(rgba?|hsla?)$/i.test(m[1])) return '';
+  return s;
+}
+const FEATURE = /^\s*(normal|"[a-z0-9]{4}"(\s+(\d{1,3}|on|off))?(\s*,\s*"[a-z0-9]{4}"(\s+(\d{1,3}|on|off))?)*)\s*$/i;
+
+/** Link target from a document: script and file schemes become '#'. */
+export function safeHref(href: unknown): string {
+  const h = String(href ?? '').trim();
+  if (isScriptUrl(h)) return '#';
+  const scheme = /^([a-z][\w+.-]*):/i.exec(h.replace(/[\u0000- \u007f-\u009f]+/g, ''));
+  return !scheme || /^(https?|mailto|tel|ftp|sms|geo)$/i.test(scheme[1]) ? h : '#';
+}
+
+/** Image source from a document: http(s), blob, data:image/* or relative; anything else is ''. */
+export function safeImageSrc(src: unknown): string {
+  const u = String(src ?? '').trim();
+  const scheme = /^([a-z][\w+.-]*):/i.exec(u.replace(/[\u0000- \u007f-\u009f]+/g, ''));
+  if (!scheme) return u;
+  const sc = scheme[1].toLowerCase();
+  if (sc === 'http' || sc === 'https' || sc === 'blob' || sc === 'cid') return u;
+  return sc === 'data' && /^data:image\/[\w.+-]+[;,]/i.test(u) ? u : '';
+}
 
 /** Convert a CSS length to points. Supports pt, px, in, cm, mm, em (assumes 12pt em). */
 export function cssToPt(v: string | null | undefined): number | null {
@@ -81,42 +124,43 @@ export function styleLevel(style: string | null | undefined, outlineLevel?: numb
 }
 
 function lineHeightCss(v: string): string {
-  if (/^\d+(\.\d+)?$/.test(v)) return `line-height:${v}`;
-  if (v.startsWith('atleast:')) return `line-height:max(${parseFloat(v.slice(8))}pt, 1.15em)`;
-  if (v.endsWith('pt')) return `line-height:${v}`;
-  return `line-height:${v}`;
+  const s = String(v);
+  if (s.startsWith('atleast:')) { const n = parseFloat(s.slice(8)); return Number.isFinite(n) ? `line-height:max(${n}pt, 1.15em)` : ''; }
+  const c = cssv(s);
+  return c ? `line-height:${c}` : '';
 }
 
 function borderCss(v: string): string {
   try {
     const b = JSON.parse(v);
     const out: string[] = [];
-    for (const side of ['top', 'right', 'bottom', 'left']) if (b[side]) out.push(`border-${side}:${b[side]}`);
-    if (b.padding != null) out.push(`--qf-bpad:${b.padding}pt`);
+    if (!b || typeof b !== 'object') throw new Error('not an object');
+    for (const side of ['top', 'right', 'bottom', 'left']) if (b[side] && cssv(b[side])) out.push(`border-${side}:${cssv(b[side])}`);
+    if (cssNum(b.padding) != null) out.push(`--qf-bpad:${cssNum(b.padding)}pt`);
     return out.join(';');
   } catch {
-    return `border:${v}`;
+    return cssv(v) ? `border:${cssv(v)}` : '';
   }
 }
 
 export function paragraphStyleString(a: Attrs): string {
   const s: string[] = [];
-  if (a.align) s.push(`text-align:${a.align === 'distribute' ? 'justify;text-align-last:justify' : a.align}`);
-  if (a.indentLeft != null) s.push(`margin-left:${a.indentLeft}pt`);
-  if (a.indentRight != null) s.push(`margin-right:${a.indentRight}pt`);
-  if (a.indentFirst != null) s.push(`text-indent:${a.indentFirst}pt`);
-  if (a.spaceBefore != null) s.push(`padding-top:${a.spaceBefore}pt`);
-  if (a.spaceAfter != null) s.push(`padding-bottom:${a.spaceAfter}pt`);
+  if (cssKw(a.align)) s.push(`text-align:${a.align === 'distribute' ? 'justify;text-align-last:justify' : a.align}`);
+  if (cssNum(a.indentLeft) != null) s.push(`margin-left:${cssNum(a.indentLeft)}pt`);
+  if (cssNum(a.indentRight) != null) s.push(`margin-right:${cssNum(a.indentRight)}pt`);
+  if (cssNum(a.indentFirst) != null) s.push(`text-indent:${cssNum(a.indentFirst)}pt`);
+  if (cssNum(a.spaceBefore) != null) s.push(`padding-top:${cssNum(a.spaceBefore)}pt`);
+  if (cssNum(a.spaceAfter) != null) s.push(`padding-bottom:${cssNum(a.spaceAfter)}pt`);
   if (a.lineHeight) s.push(lineHeightCss(a.lineHeight));
-  if (a.bg) s.push(`background-color:${a.bg}`);
-  if (a.border) s.push(borderCss(a.border));
+  if (cssColor(a.bg)) s.push(`background-color:${cssColor(a.bg)}`);
+  if (a.border) s.push(borderCss(String(a.border)));
   if (a.tabs) {
     try {
       const t = JSON.parse(a.tabs);
-      if (Array.isArray(t) && t.length && t[0].pos) s.push(`tab-size:${t[0].pos}pt`);
+      if (Array.isArray(t) && t.length && cssNum(t[0]?.pos)) s.push(`tab-size:${cssNum(t[0].pos)}pt`);
     } catch { /* ignore */ }
   }
-  return s.join(';');
+  return s.filter(Boolean).join(';');
 }
 
 function paraDomAttrs(node: PMNode): Attrs {
@@ -136,6 +180,11 @@ function paraDomAttrs(node: PMNode): Attrs {
   if (a.tabs) out['data-tabs'] = a.tabs;
   if (a.id) out.id = a.id;
   if (a.hidden) out['data-hidden'] = '1';
+  // Tracked insertion/deletion of the paragraph mark (Compare); CSS shows a coloured pilcrow.
+  if (a.change?.kind === 'insertion' || a.change?.kind === 'deletion') {
+    out['data-change'] = JSON.stringify(a.change);
+    out.class = a.change.kind === 'deletion' ? 'qf-pmark-del' : 'qf-pmark-ins';
+  }
   return out;
 }
 
@@ -164,6 +213,7 @@ function parseParaAttrs(dom: HTMLElement, styleFromTag?: string): Attrs {
   attrs.tabs = dom.getAttribute('data-tabs');
   attrs.id = dom.getAttribute('id');
   attrs.hidden = dom.hasAttribute('data-hidden');
+  attrs.change = blockChangeFromDom(dom);
   const bt = st.borderTop, bb = st.borderBottom, bl = st.borderLeft, br = st.borderRight;
   if (bt || bb || bl || br) {
     const b: Attrs = {};
@@ -188,12 +238,12 @@ const tbl = tableNodes({
     background: {
       default: null,
       getFromDOM: (dom) => (dom as HTMLElement).style.backgroundColor || (dom as HTMLElement).getAttribute('data-bg') || null,
-      setDOMAttr: (value, attrs) => { if (value) attrs.style = (attrs.style || '') + `background-color:${value};`; },
+      setDOMAttr: (value, attrs) => { if (cssColor(value)) attrs.style = (attrs.style || '') + `background-color:${cssColor(value)};`; },
     },
     valign: {
       default: null,
       getFromDOM: (dom) => (dom as HTMLElement).style.verticalAlign || null,
-      setDOMAttr: (value, attrs) => { if (value) attrs.style = (attrs.style || '') + `vertical-align:${value};`; },
+      setDOMAttr: (value, attrs) => { if (cssKw(value)) attrs.style = (attrs.style || '') + `vertical-align:${value};`; },
     },
     borders: {
       default: null,
@@ -201,7 +251,7 @@ const tbl = tableNodes({
       setDOMAttr: (value, attrs) => {
         if (value) {
           attrs['data-borders'] = value;
-          attrs.style = (attrs.style || '') + borderCss(value as string) + ';';
+          attrs.style = (attrs.style || '') + borderCss(String(value)) + ';';
         }
       },
     },
@@ -254,11 +304,12 @@ const tableSpec: NodeSpec = {
   toDOM(node) {
     const a = node.attrs;
     const style: string[] = [];
-    if (a.width) style.push(`width:${typeof a.width === 'number' ? a.width + 'pt' : a.width}`);
+    const w = typeof a.width === 'number' ? (cssNum(a.width) != null ? a.width + 'pt' : '') : cssv(a.width);
+    if (w) style.push(`width:${w}`);
     if (a.layout === 'fixed') style.push('table-layout:fixed');
     if (a.align === 'center') style.push('margin-left:auto;margin-right:auto');
     else if (a.align === 'right') style.push('margin-left:auto;margin-right:0');
-    if (a.indent) style.push(`margin-left:${a.indent}pt`);
+    if (cssNum(a.indent)) style.push(`margin-left:${cssNum(a.indent)}pt`);
     const attrs: Attrs = {
       'data-style': a.style,
       'data-banded': a.banded ? '1' : '0',
@@ -324,6 +375,30 @@ export function blockChangeDom(change: Attrs | null | undefined, attrs: Attrs = 
   };
 }
 
+/** Style declarations for an image node (shared by toDOM and the image node view). */
+export function imageStyle(a: Attrs, crop = false): string[] {
+  const s: string[] = [];
+  if (cssNum(a.width)) s.push(`width:${cssNum(a.width)}pt`);
+  if (cssNum(a.height)) s.push(`height:${cssNum(a.height)}pt`);
+  const tr: string[] = [];
+  if (cssNum(a.rotate)) tr.push(`rotate(${cssNum(a.rotate)}deg)`);
+  if (a.flipH) tr.push('scaleX(-1)');
+  if (a.flipV) tr.push('scaleY(-1)');
+  if (tr.length) s.push(`transform:${tr.join(' ')}`);
+  if (cssv(a.border)) s.push(`border:${cssv(a.border)}`);
+  if (cssFilter(a.filter)) s.push(`filter:${cssFilter(a.filter)}`);
+  if (cssNum(a.opacity) != null) s.push(`opacity:${cssNum(a.opacity)}`);
+  if (a.shadow) s.push('box-shadow:4px 4px 8px rgba(0,0,0,.4)');
+  if (crop && a.crop) {
+    try {
+      const c = JSON.parse(a.crop);
+      const n = (v: unknown) => cssNum(v) ?? 0;
+      s.push(`clip-path:inset(${n(c.t)}% ${n(c.r)}% ${n(c.b)}% ${n(c.l)}%)`);
+    } catch { /* */ }
+  }
+  return s;
+}
+
 const nodes: Record<string, NodeSpec> = {
   doc: {
     content: 'block+',
@@ -333,7 +408,8 @@ const nodes: Record<string, NodeSpec> = {
   paragraph: {
     content: 'inline*',
     group: 'block',
-    attrs: paraAttrSpec,
+    // `change` is kept out of PARA_DEFAULTS: it is a revision, not formatting.
+    attrs: { ...paraAttrSpec, ...changeAttr },
     parseDOM: [
       { tag: 'p', getAttrs: (dom) => parseParaAttrs(dom as HTMLElement) },
       ...headingTags.map((t, i) => ({ tag: t, getAttrs: (dom: HTMLElement) => parseParaAttrs(dom, `Heading ${i + 1}`) })),
@@ -362,7 +438,7 @@ const nodes: Record<string, NodeSpec> = {
     group: 'block',
     attrs: { style: { default: 'solid' }, color: { default: null }, weight: { default: 1 }, ...changeAttr },
     parseDOM: [{ tag: 'hr', getAttrs: (d) => ({ style: (d as HTMLElement).getAttribute('data-hr-style') || 'solid', change: blockChangeFromDom(d as HTMLElement) }) }],
-    toDOM: (node) => ['hr', blockChangeDom(node.attrs.change, { 'data-hr-style': node.attrs.style, style: `border-top-style:${node.attrs.style};border-top-width:${node.attrs.weight}pt;${node.attrs.color ? 'border-color:' + node.attrs.color : ''}` })],
+    toDOM: (node) => ['hr', blockChangeDom(node.attrs.change, { 'data-hr-style': node.attrs.style, style: `border-top-style:${cssKw(node.attrs.style) || 'solid'};border-top-width:${cssNum(node.attrs.weight) ?? 1}pt;${cssColor(node.attrs.color) ? 'border-color:' + cssColor(node.attrs.color) : ''}` })],
   },
 
   page_break: {
@@ -402,9 +478,9 @@ const nodes: Record<string, NodeSpec> = {
     attrs: { bullet: { default: 'disc' }, indent: { default: null } },
     parseDOM: [{ tag: 'ul:not([data-type=task])', getAttrs: (d) => ({ bullet: (d as HTMLElement).getAttribute('data-bullet') || (d as HTMLElement).style.listStyleType || 'disc' }) }],
     toDOM: (node) => {
-      const b = node.attrs.bullet as string;
+      const b = String(node.attrs.bullet ?? 'disc');
       const known = ['disc', 'circle', 'square', 'none'];
-      const style = known.includes(b) ? `list-style-type:${b}` : `list-style-type:"${b} "`;
+      const style = known.includes(b) ? `list-style-type:${b}` : `list-style-type:"${cssString(b)} "`;
       return ['ul', { 'data-bullet': b, style }, 0];
     },
   },
@@ -429,7 +505,7 @@ const nodes: Record<string, NodeSpec> = {
     }],
     toDOM: (node) => {
       const a = node.attrs;
-      const attrs: Attrs = { 'data-format': a.format, style: `list-style-type:${a.outline ? 'none' : a.format}` };
+      const attrs: Attrs = { 'data-format': a.format, style: `list-style-type:${a.outline ? 'none' : cssKw(a.format) || 'decimal'}` };
       const order = Number.isFinite(Number(a.order)) ? Math.trunc(Number(a.order)) : 1;
       if (order !== 1) attrs.start = order;
       if (a.outline) attrs['data-outline'] = '1';
@@ -478,7 +554,7 @@ const nodes: Record<string, NodeSpec> = {
       'data-count': node.attrs.count,
       'data-gap': node.attrs.gap,
       'data-rule': node.attrs.rule ? '1' : '0',
-      style: `column-count:${node.attrs.count};column-gap:${node.attrs.gap}pt;${node.attrs.rule ? 'column-rule:1px solid currentColor' : ''}`,
+      style: `column-count:${cssNum(node.attrs.count) ?? 2};column-gap:${cssNum(node.attrs.gap) ?? 36}pt;${node.attrs.rule ? 'column-rule:1px solid currentColor' : ''}`,
     }, 0],
   },
 
@@ -504,13 +580,14 @@ const nodes: Record<string, NodeSpec> = {
     toDOM: (node) => {
       const a = node.attrs;
       const s: string[] = [];
-      if (a.border) s.push(`border:${a.border}`);
-      if (a.bg) s.push(`background-color:${a.bg}`);
-      if (a.width) s.push(`width:${/^\d+$/.test(String(a.width)) ? a.width + 'pt' : a.width}`);
-      s.push(`padding:${a.padding}pt`);
-      if (a.radius) s.push(`border-radius:${a.radius}pt`);
+      if (cssv(a.border)) s.push(`border:${cssv(a.border)}`);
+      if (cssColor(a.bg)) s.push(`background-color:${cssColor(a.bg)}`);
+      const w = /^\d+(\.\d+)?$/.test(String(a.width)) ? a.width + 'pt' : cssv(a.width);
+      if (a.width && w) s.push(`width:${w}`);
+      s.push(`padding:${cssNum(a.padding) ?? 6}pt`);
+      if (cssNum(a.radius)) s.push(`border-radius:${cssNum(a.radius)}pt`);
       if (a.shadow) s.push('box-shadow:3px 3px 6px rgba(0,0,0,.35)');
-      if (a.rotate) s.push(`transform:rotate(${a.rotate}deg)`);
+      if (cssNum(a.rotate)) s.push(`transform:rotate(${cssNum(a.rotate)}deg)`);
       return ['aside', { class: 'qf-textbox', 'data-float': a.float, 'data-kind': a.kind, 'data-width': a.width, style: s.join(';') }, 0];
     },
   },
@@ -592,19 +669,9 @@ const nodes: Record<string, NodeSpec> = {
     }],
     toDOM: (node) => {
       const a = node.attrs;
-      const s: string[] = [];
-      if (a.width) s.push(`width:${a.width}pt`);
-      if (a.height) s.push(`height:${a.height}pt`); else s.push('height:auto');
-      const tr: string[] = [];
-      if (a.rotate) tr.push(`rotate(${a.rotate}deg)`);
-      if (a.flipH) tr.push('scaleX(-1)');
-      if (a.flipV) tr.push('scaleY(-1)');
-      if (tr.length) s.push(`transform:${tr.join(' ')}`);
-      if (a.border) s.push(`border:${a.border}`);
-      if (a.filter) s.push(`filter:${a.filter}`);
-      if (a.opacity != null) s.push(`opacity:${a.opacity}`);
-      if (a.shadow) s.push('box-shadow:4px 4px 8px rgba(0,0,0,.4)');
-      const attrs: Attrs = { src: a.src, alt: a.alt, style: s.join(';'), 'data-wrap': a.wrap, class: 'qf-img' };
+      const s = imageStyle(a);
+      if (!cssNum(a.height)) s.splice(cssNum(a.width) ? 1 : 0, 0, 'height:auto');
+      const attrs: Attrs = { src: safeImageSrc(a.src), alt: a.alt, style: s.join(';'), 'data-wrap': a.wrap, class: 'qf-img' };
       if (a.title) attrs.title = a.title;
       if (a.width) attrs['data-w'] = a.width;
       if (a.height) attrs['data-h'] = a.height;
@@ -730,7 +797,7 @@ const marks: Record<string, MarkSpec> = {
       const href = (d as HTMLElement).getAttribute('href') || '';
       return isScriptUrl(href) ? false : { href, title: (d as HTMLElement).getAttribute('title') };
     } }],
-    toDOM: (m) => ['a', { href: isScriptUrl(m.attrs.href || '') ? '#' : m.attrs.href, title: m.attrs.title, rel: 'noopener noreferrer' }, 0],
+    toDOM: (m) => ['a', { href: safeHref(m.attrs.href), title: m.attrs.title, rel: 'noopener noreferrer' }, 0],
   },
   bold: {
     parseDOM: [
@@ -757,7 +824,7 @@ const marks: Record<string, MarkSpec> = {
       const s = [`text-decoration-style:${map[m.attrs.style] || 'solid'}`];
       if (m.attrs.style === 'thick') s.push('text-decoration-thickness:2.5px');
       if (m.attrs.style === 'words') s.push('text-decoration-skip-ink:auto');
-      if (m.attrs.color) s.push(`text-decoration-color:${m.attrs.color}`);
+      if (cssColor(m.attrs.color)) s.push(`text-decoration-color:${cssColor(m.attrs.color)}`);
       return ['u', { 'data-u': m.attrs.style, style: s.join(';') }, 0];
     },
   },
@@ -780,42 +847,42 @@ const marks: Record<string, MarkSpec> = {
   size: {
     attrs: { pt: {} },
     parseDOM: [{ style: 'font-size', getAttrs: (v) => { const p = cssToPt(v as string); return p ? { pt: Math.round(p * 2) / 2 } : false; } }],
-    toDOM: (m) => ['span', { style: `font-size:${m.attrs.pt}pt` }, 0],
+    toDOM: (m) => ['span', { style: cssNum(m.attrs.pt) ? `font-size:${cssNum(m.attrs.pt)}pt` : null }, 0],
   },
   color: {
     attrs: { color: {} },
     parseDOM: [{ style: 'color', getAttrs: (v) => ({ color: v }) }],
-    toDOM: (m) => ['span', { style: `color:${m.attrs.color}` }, 0],
+    toDOM: (m) => ['span', { style: cssColor(m.attrs.color) ? `color:${cssColor(m.attrs.color)}` : null }, 0],
   },
   highlight: {
     attrs: { color: { default: '#ffff00' } },
     parseDOM: [{ tag: 'mark', getAttrs: (d) => ({ color: (d as HTMLElement).style.backgroundColor || '#ffff00' }) }, { style: 'background-color', getAttrs: (v) => (v && v !== 'transparent' && v !== 'inherit' ? { color: v } : false) }],
-    toDOM: (m) => ['mark', { style: `background-color:${m.attrs.color}` }, 0],
+    toDOM: (m) => ['mark', { style: `background-color:${cssColor(m.attrs.color) || '#ffff00'}` }, 0],
   },
   shading: {
     attrs: { color: {} },
     parseDOM: [{ tag: 'span.qf-shade', getAttrs: (d) => ({ color: (d as HTMLElement).style.backgroundColor }) }],
-    toDOM: (m) => ['span', { class: 'qf-shade', style: `background-color:${m.attrs.color}` }, 0],
+    toDOM: (m) => ['span', { class: 'qf-shade', style: cssColor(m.attrs.color) ? `background-color:${cssColor(m.attrs.color)}` : null }, 0],
   },
   charBorder: {
     attrs: { border: { default: '1px solid currentColor' } },
     parseDOM: [{ tag: 'span.qf-cborder', getAttrs: (d) => ({ border: (d as HTMLElement).style.border }) }],
-    toDOM: (m) => ['span', { class: 'qf-cborder', style: `border:${m.attrs.border};padding:0 1px` }, 0],
+    toDOM: (m) => ['span', { class: 'qf-cborder', style: `border:${cssv(m.attrs.border) || '1px solid currentColor'};padding:0 1px` }, 0],
   },
   spacing: {
     attrs: { pt: {} },
     parseDOM: [{ style: 'letter-spacing', getAttrs: (v) => { const p = cssToPt(v as string); return p != null ? { pt: p } : false; } }],
-    toDOM: (m) => ['span', { style: `letter-spacing:${m.attrs.pt}pt` }, 0],
+    toDOM: (m) => ['span', { style: cssNum(m.attrs.pt) != null ? `letter-spacing:${cssNum(m.attrs.pt)}pt` : null }, 0],
   },
   scale: {
     attrs: { pct: { default: 100 } },
     parseDOM: [{ tag: 'span.qf-scale', getAttrs: (d) => ({ pct: num((d as HTMLElement).getAttribute('data-pct')) || 100 }) }],
-    toDOM: (m) => ['span', { class: 'qf-scale', 'data-pct': m.attrs.pct, style: `display:inline-block;transform:scaleX(${m.attrs.pct / 100});transform-origin:left` }, 0],
+    toDOM: (m) => ['span', { class: 'qf-scale', 'data-pct': m.attrs.pct, style: `display:inline-block;transform:scaleX(${(cssNum(m.attrs.pct) ?? 100) / 100});transform-origin:left` }, 0],
   },
   position: {
     attrs: { pt: {} },
     parseDOM: [{ tag: 'span.qf-pos', getAttrs: (d) => ({ pt: num((d as HTMLElement).getAttribute('data-pt')) || 0 }) }],
-    toDOM: (m) => ['span', { class: 'qf-pos', 'data-pt': m.attrs.pt, style: `position:relative;top:${-m.attrs.pt}pt` }, 0],
+    toDOM: (m) => ['span', { class: 'qf-pos', 'data-pt': m.attrs.pt, style: `position:relative;top:${-(cssNum(m.attrs.pt) ?? 0)}pt` }, 0],
   },
   typo: {
     // OpenType / typographic features: ligatures, numerals, kerning, stylistic sets.
@@ -829,10 +896,10 @@ const marks: Record<string, MarkSpec> = {
     toDOM: (m) => {
       const a = m.attrs;
       const s: string[] = [];
-      if (a.features) s.push(`font-feature-settings:${a.features}`);
-      if (a.kerning) s.push(`font-kerning:${a.kerning}`);
-      if (a.numerals) s.push(`font-variant-numeric:${a.numerals}`);
-      if (a.ligatures) s.push(`font-variant-ligatures:${a.ligatures}`);
+      if (a.features && FEATURE.test(String(a.features))) s.push(`font-feature-settings:${String(a.features).trim()}`);
+      if (cssKw(a.kerning)) s.push(`font-kerning:${a.kerning}`);
+      if (cssKws(a.numerals)) s.push(`font-variant-numeric:${cssKws(a.numerals)}`);
+      if (cssKws(a.ligatures)) s.push(`font-variant-ligatures:${cssKws(a.ligatures)}`);
       return ['span', { class: 'qf-typo', 'data-features': a.features, 'data-kerning': a.kerning, 'data-numerals': a.numerals, 'data-ligatures': a.ligatures, style: s.join(';') }, 0];
     },
   },
@@ -840,7 +907,7 @@ const marks: Record<string, MarkSpec> = {
     // Text effects: outline, shadow, emboss, engrave, glow, reflection, gradient fill.
     attrs: { kind: { default: 'shadow' }, color: { default: null } },
     parseDOM: [{ tag: 'span.qf-fx', getAttrs: (d) => ({ kind: (d as HTMLElement).getAttribute('data-kind') || 'shadow', color: (d as HTMLElement).getAttribute('data-color') }) }],
-    toDOM: (m) => ['span', { class: `qf-fx qf-fx-${m.attrs.kind}`, 'data-kind': m.attrs.kind, 'data-color': m.attrs.color, style: m.attrs.color ? `--fx:${m.attrs.color}` : null }, 0],
+    toDOM: (m) => ['span', { class: `qf-fx qf-fx-${cssKw(m.attrs.kind) || 'shadow'}`, 'data-kind': m.attrs.kind, 'data-color': m.attrs.color, style: cssColor(m.attrs.color) ? `--fx:${cssColor(m.attrs.color)}` : null }, 0],
   },
   charStyle: {
     attrs: { name: {} },
@@ -887,6 +954,7 @@ const marks: Record<string, MarkSpec> = {
   },
   formatChange: {
     attrs: { author: { default: '' }, date: { default: 0 }, id: { default: '' }, before: { default: '' } },
+    inclusive: false,
     excludes: '',
     parseDOM: [{ tag: 'span.qf-fmtchg', getAttrs: (d) => ({ author: (d as HTMLElement).getAttribute('data-author') || '', id: (d as HTMLElement).getAttribute('data-id') || '' }) }],
     toDOM: (m) => ['span', { class: 'qf-fmtchg', 'data-author': m.attrs.author, 'data-id': m.attrs.id }, 0],

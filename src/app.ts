@@ -291,6 +291,7 @@ export class App {
     const i = this.docs.indexOf(tab);
     if (i < 0) return;
     for (const t of tab.posTrackers) t.lost = true;
+    this.proofer.forget(tab);
     tab.view.destroy();
     tab.el.remove();
     this.docs.splice(i, 1);

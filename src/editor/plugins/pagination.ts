@@ -7,8 +7,9 @@
  * and footer of that page, (c) draw the gap between sheets, and (d) show the next page's
  * header. Paragraphs that straddle a page boundary are split with an inline block widget at
  * the first line that does not fit, honoring widow/orphan control, keep-with-next,
- * keep-lines-together and page-break-before. Tables and images that do not fit move to the
- * next page (they are not split).
+ * keep-lines-together and page-break-before. Lists break between items (and between or inside
+ * the paragraphs of an item), tables between rows; a single row or image that does not fit
+ * moves to the next page.
  *
  * Measurements never require removing existing widgets: block widgets are siblings of the
  * measured nodes, and the heights of inline widgets inside split paragraphs are subtracted.
@@ -37,9 +38,13 @@ export interface PageInfo {
   pages: number;
 }
 
+type BrkKind = 'block' | 'inline' | 'row';
+
 interface Brk {
   pos: number;          // doc position where the next page begins
   inline: boolean;      // break inside a paragraph
+  row: boolean;         // break between table rows (the widget is a table row)
+  cols: number;         // for row breaks: the table's column count
   fill: number;         // px of empty space to fill on the page before the break
   page: number;         // index of the page that ends here (0-based)
   fnHtml: string;       // footnote area html for the page ending here
@@ -86,6 +91,28 @@ function widgetDom(b: Brk | null, cfg: PageConfig, pages: number, last: boolean,
     top.innerHTML = `<span class="qf-pg-header">${cfg.header(pageIdx + 2, pages)}</span>`;
   }
   return el;
+}
+
+/** A page gap between table rows: a full-width row holding the gap. */
+function rowWidget(inner: HTMLElement, cols: number): HTMLElement {
+  const tr = document.createElement('tr');
+  tr.className = 'qf-pgap-row';
+  tr.contentEditable = 'false';
+  tr.setAttribute('aria-hidden', 'true');
+  const td = document.createElement('td');
+  td.colSpan = Math.max(1, cols); // more columns than the table has would widen a fixed layout
+  td.style.cssText = 'padding:0;border:0;outline:none;background:transparent;pointer-events:none';
+  td.appendChild(inner);
+  tr.appendChild(td);
+  return tr;
+}
+
+/** A hidden row next to a row gap so nth-child banding keeps its parity. */
+function rowPad(): HTMLElement {
+  const tr = document.createElement('tr');
+  tr.className = 'qf-pgap-pad';
+  tr.style.display = 'none';
+  return tr;
 }
 
 export function paginationPlugin(getConfig: () => PageConfig) {
@@ -142,14 +169,16 @@ export function paginationPlugin(getConfig: () => PageConfig) {
     if (!result) return;
     const { breaks, finalFill, finalFnHtml, finalFnH } = result;
     const pages = breaks.length + 1;
-    const sig = JSON.stringify([breaks.map((b) => [b.pos, Math.round(b.fill), b.inline, Math.round(b.fnH), b.fnHtml.length, Math.round(b.shiftLeft)]), Math.round(finalFill), finalFnH, pages, cfg.header(1, pages), cfg.footer(1, pages)]);
+    const sig = JSON.stringify([breaks.map((b) => [b.pos, Math.round(b.fill), b.inline, b.row && b.cols, Math.round(b.fnH), b.fnHtml.length, Math.round(b.shiftLeft)]), Math.round(finalFill), finalFnH, pages, cfg.header(1, pages), cfg.footer(1, pages)]);
     if (sig === cur.sig) return;
     const decos: Decoration[] = [];
     decos.push(Decoration.widget(0, () => widgetDom(null, cfg, pages, false, true, 0, '', 0, false, cfg.margin.left * PT, cfg.margin.right * PT, 0), { side: -1, key: `pg-first-${pages}-${cfg.header(1, pages)}`, ignoreSelection: true }));
     breaks.forEach((b, i) => {
-      decos.push(Decoration.widget(b.pos, () => widgetDom(b, cfg, pages, false, false, b.fill, b.fnHtml, b.fnH, b.inline, b.shiftLeft, b.shiftRight, b.page), {
-        side: -1, key: `pg-${i}-${Math.round(b.fill)}-${b.inline ? 1 : 0}-${pages}-${Math.round(b.fnH)}-${b.fnHtml.length}-${Math.round(b.shiftLeft)}`, ignoreSelection: true,
+      const make = () => widgetDom(b, cfg, pages, false, false, b.fill, b.fnHtml, b.fnH, b.inline, b.shiftLeft, b.shiftRight, b.page);
+      decos.push(Decoration.widget(b.pos, b.row ? () => rowWidget(make(), b.cols) : make, {
+        side: -1, key: `pg-${i}-${Math.round(b.fill)}-${b.inline ? 1 : b.row ? `r${b.cols}` : 0}-${pages}-${Math.round(b.fnH)}-${b.fnHtml.length}-${Math.round(b.shiftLeft)}`, ignoreSelection: true,
       }));
+      if (b.row) decos.push(Decoration.widget(b.pos, rowPad, { side: -1, key: 'pg-pad', ignoreSelection: true }));
     });
     const end = view.state.doc.content.size;
     decos.push(Decoration.widget(end, () => widgetDom(null, cfg, pages, true, false, finalFill, finalFnHtml, finalFnH, false, cfg.margin.left * PT, cfg.margin.right * PT, pages - 1), { side: 1, key: `pg-last-${Math.round(finalFill)}-${pages}-${finalFnH}-${finalFnHtml.length}`, ignoreSelection: true }));
@@ -202,8 +231,9 @@ function measure(view: EditorView, cfg: PageConfig) {
   const domRect = view.dom.getBoundingClientRect();
   const measurer = footnoteMeasurer(view, cfg, z);
 
-  const pushBreak = (pos: number, inline: boolean, shiftL = ml, shiftR = mr) => {
-    breaks.push({ pos, inline, fill: Math.max(0, contentH - used), page, fnHtml, fnH: fnUsed, shiftLeft: shiftL, shiftRight: shiftR });
+  let cols = 1; // column count of the table being broken
+  const pushBreak = (pos: number, kind: BrkKind, shiftL = ml, shiftR = mr) => {
+    breaks.push({ pos, inline: kind === 'inline', row: kind === 'row', cols, fill: Math.max(0, contentH - used), page, fnHtml, fnH: fnUsed, shiftLeft: shiftL, shiftRight: shiftR });
     page++;
     used = 0; fnUsed = 0; fnHtml = '';
   };
@@ -232,6 +262,132 @@ function measure(view: EditorView, cfg: PageConfig) {
   };
   const fnHeightOf = (list: { pos: number; node: PMNode }[]) => list.reduce((a, f) => a + measurer.height(cfg.footnoteHtml(f.node, cfg.footnoteNumber(f.pos) || '')), 0) + (list.length && !fnHtml ? 12 : 0);
 
+  type Shift = { l: number; r: number };
+  type Fn = { pos: number; node: PMNode };
+  const N = schema.nodes;
+  const isContainer = (n: PMNode) => n.type === N.bullet_list || n.type === N.ordered_list || n.type === N.task_list || n.type === N.list_item || n.type === N.task_item || n.type === N.table;
+  /** Our gap widgets inside an element (their height is not part of the natural layout). */
+  const gapsIn = (el: HTMLElement) => [...el.querySelectorAll<HTMLElement>('.qf-pgap')].map((w) => { const r = w.getBoundingClientRect(); return { top: r.top, h: r.height }; });
+  const gapH = (el: HTMLElement) => gapsIn(el).reduce((a, w) => a + w.h, 0);
+  /** Offsets of an element's content box from the page edges, for widgets placed inside it. */
+  const shiftOf = (el: HTMLElement): Shift => {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return {
+      l: (r.left - domRect.left) / z + (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.borderLeftWidth) || 0),
+      r: (domRect.right - r.right) / z + (parseFloat(cs.paddingRight) || 0) + (parseFloat(cs.borderRightWidth) || 0),
+    };
+  };
+
+  /**
+   * Split a paragraph whose top is at `used` across pages. Returns false, having placed nothing,
+   * when it should move to the next page whole but no break may go right before it.
+   */
+  const splitPara = (node: PMNode, pos: number, dom: HTMLElement, h: number, fns: Fn[], canBefore: boolean, atTop: boolean, sh: Shift): boolean => {
+    const { lines, widgetsAbove } = lineBoxes(dom);
+    if (lines.length < 2) return false;
+    const top0 = dom.getBoundingClientRect().top;
+    const naturalTop = (l: LineBox) => (l.top - top0 - widgetsAbove(l.top)) / z;
+    const naturalBottom = (l: LineBox) => (l.bottom - top0 - widgetsAbove(l.top)) / z;
+    let startLine = 0;
+    let consumedBefore = 0; // natural px of this paragraph already placed on previous pages
+    let guard = 0;
+    while (guard++ < 200) {
+      const avail = contentH - used - fnUsed;
+      // find first line that doesn't fit
+      let k = -1;
+      for (let li = startLine; li < lines.length; li++) {
+        if (naturalBottom(lines[li]) - consumedBefore > avail + 0.5) { k = li; break; }
+      }
+      if (k < 0) { used += h - consumedBefore; break; }
+      const widow = node.attrs.widowControl;
+      if (widow) {
+        if (k - startLine < 2 && startLine === 0) k = startLine; // orphan: move whole paragraph
+        else if (lines.length - k < 2 && k - 1 > startLine) k = k - 1; // widow: pull a line over
+      }
+      if (k <= startLine) {
+        if (startLine === 0 && !atTop) {
+          if (!canBefore) return false;
+          pushBreak(pos, 'block', sh.l, sh.r); consumedBefore = 0; atTop = true; continue;
+        }
+        // cannot split meaningfully (first line taller than a page)
+        used += h - consumedBefore; break;
+      }
+      // position at the start of line k
+      const line = lines[k];
+      const y = (line.top + line.bottom) / 2;
+      const found = view.posAtCoords({ left: Math.max(domRect.left + 1, line.left + 1), top: y });
+      let splitPos = found ? found.pos : -1;
+      if (splitPos <= pos + 1 || splitPos >= pos + node.nodeSize - 1) { used += h - consumedBefore; break; }
+      // ensure splitPos is at the start of the line (not at end of previous line)
+      try {
+        const c = view.coordsAtPos(splitPos, 1);
+        if (c.top < line.top - 2) splitPos += 1;
+      } catch { /* */ }
+      const beforeH = naturalTop(line) - consumedBefore;
+      used += beforeH;
+      addFootnotes(fns.filter((f) => f.pos < splitPos && f.pos >= (breaks.length ? breaks[breaks.length - 1].pos : 0)));
+      const pr = dom.getBoundingClientRect();
+      const cs = getComputedStyle(dom);
+      const padL = parseFloat(cs.paddingLeft) || 0, padR = parseFloat(cs.paddingRight) || 0;
+      const leftOffset = (pr.left - domRect.left) / z + padL; // content box left from editor border-box
+      const rightOffset = (domRect.right - pr.right) / z + padR;
+      pushBreak(splitPos, 'inline', leftOffset, rightOffset);
+      consumedBefore = naturalTop(line);
+      startLine = k;
+    }
+    // footnotes after the last split point
+    const lastBreak = breaks.length ? breaks[breaks.length - 1].pos : 0;
+    if (lastBreak > pos) addFootnotes(fns.filter((f) => f.pos >= lastBreak));
+    else addFootnotes(fns);
+    return true;
+  };
+
+  /**
+   * Place a block whose top is at `used`, leaving `used` at its bottom. Returns false, having
+   * placed nothing, when the block must move to the next page but `canBefore` forbids a break
+   * right before it (the first child of a list item or list): the caller breaks earlier.
+   */
+  const placeNode = (node: PMNode, pos: number, dom: HTMLElement, h: number, fns: Fn[], canBefore: boolean, atTop: boolean, sh: Shift, kind: BrkKind): boolean => {
+    if (h + fnHeightOf(fns) <= contentH - used - fnUsed + 0.5) { used += h; addFootnotes(fns); return true; }
+    if (node.type === N.paragraph && !node.attrs.keepLines) {
+      if (splitPara(node, pos, dom, h, fns, canBefore, atTop, sh)) return true;
+    } else if (isContainer(node)) {
+      if (placeContainer(node, pos, dom, atTop)) return true;
+    }
+    if (atTop) { used += h; addFootnotes(fns); if (used > contentH) used = contentH; return true; } // overflowing block: the page grows
+    if (!canBefore) return false;
+    pushBreak(pos, kind, sh.l, sh.r);
+    return placeNode(node, pos, dom, h, fns, canBefore, true, sh, kind);
+  };
+
+  /** Place a list, list item or table child by child, breaking between children. */
+  const placeContainer = (node: PMNode, pos: number, dom: HTMLElement, entryTop: boolean): boolean => {
+    const kids: { node: PMNode; pos: number; el: HTMLElement }[] = [];
+    node.forEach((c, off) => { const el = view.nodeDOM(pos + 1 + off); if (el instanceof HTMLElement) kids.push({ node: c, pos: pos + 1 + off, el }); });
+    if (!kids.length || !kids[0].el.parentElement) return false;
+    const kind: BrkKind = node.type === N.table ? 'row' : 'block';
+    if (kind === 'row') { cols = 0; node.firstChild?.forEach((c) => { cols += c.attrs.colspan || 1; }); }
+    const sh = shiftOf(kids[0].el.parentElement);
+    const r0 = dom.getBoundingClientRect();
+    const gaps = gapsIn(dom);
+    const nat = (y: number) => (y - r0.top - gaps.filter((w) => w.top < y - 0.5).reduce((a, w) => a + w.h, 0)) / z;
+    const entryUsed = used;
+    let off = used; // page fill at the container's natural top (minus what earlier pages took)
+    for (let k = 0; k < kids.length; k++) {
+      const c = kids[k];
+      const cr = c.el.getBoundingClientRect();
+      const t = nat(cr.top);
+      const hc = (cr.height - gaps.filter((w) => w.top >= cr.top - 0.5 && w.top < cr.bottom).reduce((a, w) => a + w.h, 0)) / z;
+      used = off + t;
+      const ok = placeNode(c.node, c.pos, c.el, hc, footnotesIn(c.node, c.pos), k > 0, used < 0.5 || (k === 0 && entryTop), sh, kind);
+      if (!ok) { used = entryUsed; return false; }
+      off = used - (t + hc);
+    }
+    used = Math.min(contentH, off + (r0.height - gaps.reduce((a, w) => a + w.h, 0)) / z);
+    return true;
+  };
+
   const children: { node: PMNode; pos: number }[] = [];
   doc.forEach((node, offset) => children.push({ node, pos: offset }));
 
@@ -241,13 +397,11 @@ function measure(view: EditorView, cfg: PageConfig) {
     if (!dom || !(dom instanceof HTMLElement)) continue;
     const r = dom.getBoundingClientRect();
     const isPara = node.type === schema.nodes.paragraph;
-    const { lines, widgetsAbove } = isPara ? lineBoxes(dom) : { lines: [] as LineBox[], widgetsAbove: () => 0 };
-    const inlineWidgetH = isPara ? widgetsAbove(r.bottom + 1) : 0;
-    let h = (r.height - inlineWidgetH) / z;
+    const h = (r.height - gapH(dom)) / z;
     const fns = footnotesIn(node, pos);
     const fnH = fnHeightOf(fns);
 
-    if (isPara && node.attrs.pageBreakBefore && used > 0) pushBreak(pos, false);
+    if (isPara && node.attrs.pageBreakBefore && used > 0) pushBreak(pos, 'block');
 
     const remaining = contentH - used - fnUsed;
     if (h + fnH <= remaining + 0.5) {
@@ -257,79 +411,21 @@ function measure(view: EditorView, cfg: PageConfig) {
         if (nd) {
           const nh = nd.getBoundingClientRect().height / z;
           const firstLines = Math.min(nh, 2.2 * 16);
-          if (h + fnH + firstLines > remaining) { pushBreak(pos, false); }
+          if (h + fnH + firstLines > remaining) { pushBreak(pos, 'block'); }
         }
       }
       used += h; addFootnotes(fns);
-    } else if (isPara && !node.attrs.keepLines && lines.length >= 2) {
-      // Split the paragraph across pages, possibly several times.
-      const top0 = r.top;
-      const naturalTop = (l: LineBox) => (l.top - top0 - widgetsAbove(l.top)) / z;
-      const naturalBottom = (l: LineBox) => (l.bottom - top0 - widgetsAbove(l.top)) / z;
-      let startLine = 0;
-      let consumedBefore = 0; // natural px of this paragraph already placed on previous pages
-      let guard = 0;
-      while (guard++ < 200) {
-        const avail = contentH - used - fnUsed;
-        // find first line that doesn't fit
-        let k = -1;
-        for (let li = startLine; li < lines.length; li++) {
-          if (naturalBottom(lines[li]) - consumedBefore > avail + 0.5) { k = li; break; }
-        }
-        if (k < 0) { used += h - consumedBefore; break; }
-        const widow = node.attrs.widowControl;
-        if (widow) {
-          if (k - startLine < 2 && startLine === 0) k = startLine; // orphan: move whole paragraph
-          else if (lines.length - k < 2 && k - 1 > startLine) k = k - 1; // widow: pull a line over
-        }
-        if (k <= startLine) {
-          if (used > 0 || startLine > 0) {
-            if (startLine === 0) { pushBreak(pos, false); consumedBefore = 0; startLine = 0; continue; }
-          }
-          // cannot split meaningfully (first line taller than a page)
-          used += h - consumedBefore; break;
-        }
-        // position at the start of line k
-        const line = lines[k];
-        const y = (line.top + line.bottom) / 2;
-        const found = view.posAtCoords({ left: Math.max(domRect.left + 1, line.left + 1), top: y });
-        let splitPos = found ? found.pos : -1;
-        if (splitPos <= pos + 1 || splitPos >= pos + node.nodeSize - 1) { used += h - consumedBefore; break; }
-        // ensure splitPos is at the start of the line (not at end of previous line)
-        try {
-          const c = view.coordsAtPos(splitPos, 1);
-          if (c.top < line.top - 2) splitPos += 1;
-        } catch { /* */ }
-        const beforeH = naturalTop(line) - consumedBefore;
-        used += beforeH;
-        addFootnotes(fns.filter((f) => f.pos < splitPos && f.pos >= (breaks.length ? breaks[breaks.length - 1].pos : 0)));
-        const pr = dom.getBoundingClientRect();
-        const cs = getComputedStyle(dom);
-        const padL = parseFloat(cs.paddingLeft) || 0, padR = parseFloat(cs.paddingRight) || 0;
-        const leftOffset = (pr.left - domRect.left) / z + padL; // content box left from editor border-box
-        const rightOffset = (domRect.right - pr.right) / z + padR;
-        pushBreak(splitPos, true, leftOffset, rightOffset);
-        consumedBefore = naturalTop(line);
-        startLine = k;
-      }
-      // footnotes after the last split point
-      const lastBreak = breaks.length ? breaks[breaks.length - 1].pos : 0;
-      if (lastBreak > pos) addFootnotes(fns.filter((f) => f.pos >= lastBreak));
-      else addFootnotes(fns);
     } else {
-      // unsplittable block
-      if (used > 0) pushBreak(pos, false);
-      used += h; addFootnotes(fns);
-      if (used > contentH) used = contentH; // overflowing block: the page grows
+      placeNode(node, pos, dom, h, fns, true, used <= 0, { l: ml, r: mr }, 'block');
     }
 
     const forced = node.type === schema.nodes.page_break || (node.type === schema.nodes.section_break && node.attrs.kind !== 'continuous');
     if (forced && i + 1 < children.length) {
-      pushBreak(children[i + 1].pos, false);
+      pushBreak(children[i + 1].pos, 'block');
       if (node.type === schema.nodes.section_break && (node.attrs.kind === 'oddPage' || node.attrs.kind === 'evenPage')) {
         const wantOdd = node.attrs.kind === 'oddPage';
         const isOdd = (page + 1) % 2 === 1;
-        if (wantOdd !== isOdd) { used = 0; pushBreak(children[i + 1].pos, false); }
+        if (wantOdd !== isOdd) { used = 0; pushBreak(children[i + 1].pos, 'block'); }
       }
     }
   }

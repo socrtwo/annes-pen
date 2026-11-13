@@ -90,7 +90,7 @@ export const BUILTIN_STYLES: StyleDef[] = [
 
 /** Style sets reshape the built-in styles (Design ▸ Style Set). */
 export const STYLE_SETS: Record<string, Record<string, any> & { _fonts?: [string, string] }> = {
-  QuillPen: { _fonts: ['Carlito', 'Carlito'] },
+  QuillPen: { _fonts: ['Carlito', 'Carlito'] }, // rename:keep — stored key of the default set; shown via designLabel()
   Classic: {
     _fonts: ['Tinos', 'Tinos'],
     Normal: { size: 12, spaceAfter: 0, lineHeight: '1.15' },
@@ -156,6 +156,12 @@ export const STYLE_SETS: Record<string, Record<string, any> & { _fonts?: [string
   },
 };
 
+/** What the Design tab shows for a style set or theme key (the default's key is the old "QuillPen"). */
+export function designLabel(key: string): string {
+  return key === 'QuillPen' ? 'Anne\'s Pen' : key; // rename:keep
+}
+
+// rename:keep — the default theme's key stays "QuillPen" for documents that store it.
 export const THEMES: Record<string, { headingFont: string; bodyFont: string; accent: string[] }> = {
   QuillPen: { headingFont: 'Carlito', bodyFont: 'Carlito', accent: ['#2b579a', '#c0504d', '#9bbb59', '#8064a2', '#4bacc6', '#f79646'] },
   Slate: { headingFont: 'Arimo', bodyFont: 'Arimo', accent: ['#3f4f5f', '#6f8fa8', '#b7c9d8', '#9c6644', '#c58f6a', '#e0b590'] },

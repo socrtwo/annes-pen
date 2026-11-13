@@ -8,7 +8,7 @@ import { schema, styleLevel } from '../editor/schema';
 import { allStyles, resolveStyles, effectiveStyle, fontStack } from '../editor/styles';
 import { setFind, selectMatch, findKey, proofKey } from '../editor/plugins/decorations';
 import { listChanges, resolveChanges } from '../editor/plugins/trackChanges';
-import { pageOfPos, pageInfo } from '../editor/plugins/pagination';
+import { pageOfPos, pageInfo, pageKey } from '../editor/plugins/pagination';
 import { replaceAll } from '../commands/edit';
 import { commentRanges, updateComment, refuseIfProtected } from '../commands/review';
 import { currentParagraph, setParagraphStyle } from '../editor/ops';
@@ -29,7 +29,6 @@ export interface PaneDef {
 
 const N = schema.nodes;
 const M = schema.marks;
-let lastDoc: PMNode | null = null;
 
 /** True while the user is typing in a text field of the pane: redrawing it then would destroy the field
  *  (on phones the on-screen keyboard resizes the window, which refreshes every pane). */
@@ -94,7 +93,16 @@ const navigation: PaneDef = {
     el.append(search, tabs, list);
     draw();
   },
-  update(app, el) { if (app.state.doc !== lastDoc || true) (el as any)._draw?.(); },
+  update(app, el) {
+    // Redraw only when something the list shows changed: the document, the heading the
+    // selection is in, find results, pagination or the view mode.
+    const st = app.state;
+    const key = [st.doc, st.selection.$from.index(0), findKey.getState(st), pageKey.getState(st)?.info, app.tab.viewMode];
+    const prev = (el as any)._navKey as unknown[] | undefined;
+    if (prev && prev.length === key.length && prev.every((x, i) => x === key[i])) return;
+    (el as any)._navKey = key;
+    (el as any)._draw?.();
+  },
   onClose(app) { setFind(app.view, { query: '' }); },
 };
 
@@ -197,14 +205,13 @@ const find: PaneDef = {
     const q = h('input', { placeholder: 'Find', 'aria-label': 'Find', value: opts.query || '' }) as HTMLInputElement;
     const r = h('input', { placeholder: 'Replace with', 'aria-label': 'Replace with' }) as HTMLInputElement;
     const chk = (label: string, title = '') => { const i = h('input', { type: 'checkbox' }) as HTMLInputElement; return { i, el: h('label', { class: 'qf-check', title }, i, ' ', label) }; };
-    const cs = chk('Match case'), ww = chk('Whole words'), re = chk('Regular expressions', 'JavaScript regex; $1 in replacement'), wc = chk('Wildcards (? * ^#)', '? any char, * any run, ^# digit, ^p paragraph, ^t tab'), sel = chk('In selection only'), pc = chk('Preserve case');
+    const cs = chk('Match case'), ww = chk('Whole words'), re = chk('Regular expressions', 'JavaScript regex; $1 in replacement'), wc = chk('Wildcards (? * ^#)', '? or ^? any char, * any run, ^# digit, ^$ letter, ^p paragraph, ^t tab'), sel = chk('In selection only'), pc = chk('Preserve case');
     const count = h('div', { class: 'qf-help' });
     const style = h('input', { placeholder: 'Apply style to matches (optional)', 'aria-label': 'Replace style' }) as HTMLInputElement;
     const apply = () => {
-      const s = setFind(app.view, { query: q.value, regex: re.i.checked || wc.i.checked ? true : false, caseSensitive: cs.i.checked, wholeWord: ww.i.checked, current: -1 });
-      if (wc.i.checked && q.value) { /* wildcard translation handled in replaceAll; for highlighting approximate with regex */ setFind(app.view, { query: q.value.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\?/g, '.').replace(/\*/g, '.*?').replace(/\\\^#/g, '\\d'), regex: true }); }
+      // Same matcher as Replace All (buildMatcher), so highlights and replacements agree.
+      setFind(app.view, { query: q.value, regex: re.i.checked, wildcards: wc.i.checked && !re.i.checked, caseSensitive: cs.i.checked, wholeWord: ww.i.checked, current: -1 });
       count.textContent = q.value ? `${findKey.getState(app.state)!.matches.length} match(es)` : '';
-      void s;
     };
     for (const x of [q, cs.i, ww.i, re.i, wc.i]) x.addEventListener('input', apply);
     q.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); app.exec(e.shiftKey ? 'edit.findPrev' : 'edit.findNext'); } });

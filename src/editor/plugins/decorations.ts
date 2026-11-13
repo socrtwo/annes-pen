@@ -1,7 +1,8 @@
 /** Decoration-only plugins. */
-import { Plugin, PluginKey, TextSelection, type EditorState } from 'prosemirror-state';
+import { Plugin, PluginKey, TextSelection, type EditorState, type Transaction } from 'prosemirror-state';
 import { Decoration, DecorationSet, type EditorView } from 'prosemirror-view';
 import type { Node as PMNode } from 'prosemirror-model';
+import { ReplaceStep, ReplaceAroundStep, AddMarkStep, RemoveMarkStep } from 'prosemirror-transform';
 import { schema, styleLevel } from '../schema';
 import { normalizeSettings } from '../settings';
 
@@ -35,6 +36,35 @@ export function toAlpha(n: number): string {
   return s;
 }
 
+/** Ranges of the new document touched by a transaction's steps. */
+export function changedRanges(tr: Transaction): { from: number; to: number }[] {
+  const out: { from: number; to: number }[] = [];
+  tr.mapping.maps.forEach((m, i) => m.forEach((_os, _oe, ns, ne) => {
+    const rest = tr.mapping.slice(i + 1);
+    out.push({ from: rest.map(ns, -1), to: rest.map(ne, 1) });
+  }));
+  return out;
+}
+
+/** True when a step replaced content containing a node of the given type (before or after). */
+function touchesType(tr: Transaction, type: unknown): boolean {
+  const has = (doc: PMNode, from: number, to: number) => {
+    let hit = false;
+    doc.nodesBetween(Math.max(0, from), Math.min(doc.content.size, to), (n) => { if (n.type === type) hit = true; return !hit; });
+    return hit;
+  };
+  for (let i = 0; i < tr.steps.length; i++) {
+    const st = tr.steps[i];
+    // Attribute steps have an empty step map, so they cannot be checked by range.
+    if (!(st instanceof ReplaceStep || st instanceof ReplaceAroundStep || st instanceof AddMarkStep || st instanceof RemoveMarkStep)) return true;
+    const before = tr.docs[i];
+    let hit = false;
+    tr.steps[i].getMap().forEach((os, oe) => { if (!hit && os < oe && has(before, os, oe)) hit = true; });
+    if (hit) return true;
+  }
+  return changedRanges(tr).some((r) => r.from < r.to && has(tr.doc, r.from, r.to));
+}
+
 function computeFootnotes(doc: PMNode) {
   const settings = normalizeSettings(doc.attrs.settings);
   const labels = new Map<number, string>();
@@ -56,7 +86,16 @@ const footnotes = new Plugin({
   key: footnoteKey,
   state: {
     init: (_c, state) => computeFootnotes(state.doc),
-    apply: (tr, v) => (tr.docChanged ? computeFootnotes(tr.doc) : v),
+    apply: (tr, v) => {
+      if (!tr.docChanged) return v;
+      // Typing elsewhere keeps the numbering: map it instead of rescanning the document.
+      if (tr.doc.attrs.settings === tr.before.attrs.settings && !touchesType(tr, schema.nodes.footnote)) {
+        const labels = new Map<number, string>();
+        for (const [pos, l] of v.labels) labels.set(tr.mapping.map(pos, 1), l);
+        return { deco: v.deco.map(tr.mapping, tr.doc), labels };
+      }
+      return computeFootnotes(tr.doc);
+    },
   },
   props: { decorations: (state) => footnoteKey.getState(state)!.deco },
 });
@@ -68,13 +107,14 @@ export function footnoteLabel(state: EditorState, pos: number): string | null {
 // ------------------------------------------------------------------------------------------
 // Find highlights
 
-export interface FindState { query: string; regex: boolean; caseSensitive: boolean; wholeWord: boolean; matches: { from: number; to: number }[]; current: number; deco: DecorationSet }
+export interface FindState { query: string; regex: boolean; caseSensitive: boolean; wholeWord: boolean; /** Word-style wildcards (? * ^# ^$ ^?), as Replace All uses them. */ wildcards?: boolean; matches: { from: number; to: number }[]; current: number; deco: DecorationSet }
 export const findKey = new PluginKey<FindState>('find');
 
 export function buildMatcher(q: string, regex: boolean, cs: boolean, whole: boolean, wildcards = false): RegExp | null {
   if (!q) return null;
   let src = regex ? q : q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  if (wildcards && !regex) src = src.replace(/\\\?/g, '.').replace(/\\\*/g, '.*?').replace(/\\\^\\#/g, '\\d').replace(/\\\^\\\$/g, '\\p{L}');
+  // After escaping, ^# is \^# (# is not escaped), ^$ is \^\$ and ^? is \^\?. The ^ codes go first so ^? is not read as ^ then ?.
+  if (wildcards && !regex) src = src.replace(/\\\^\\\?/g, '.').replace(/\\\^#/g, '\\d').replace(/\\\^\\\$/g, '\\p{L}').replace(/\\\?/g, '.').replace(/\\\*/g, '.*?');
   if (!regex) src = src.replace(/\\\^p/g, '\n').replace(/\\\^t/g, '\t');
   if (whole) src = `(?<![\\p{L}\\p{N}_])(?:${src})(?![\\p{L}\\p{N}_])`;
   try { return new RegExp(src, 'gu' + (cs ? '' : 'i')); } catch { return null; }
@@ -120,7 +160,7 @@ const find = new Plugin<FindState>({
       if (meta) s = { ...v, ...meta };
       if (!s.query) return { ...s, matches: [], deco: DecorationSet.empty, current: -1 };
       if (meta || tr.docChanged) {
-        const matches = findMatches(tr.doc, buildMatcher(s.query, s.regex, s.caseSensitive, s.wholeWord));
+        const matches = findMatches(tr.doc, buildMatcher(s.query, s.regex, s.caseSensitive, s.wholeWord, !!s.wildcards));
         const current = Math.min(s.current, matches.length - 1);
         const deco = DecorationSet.create(tr.doc, matches.map((m, i) => Decoration.inline(m.from, m.to, { class: i === current ? 'qf-find qf-find-current' : 'qf-find' })));
         return { ...s, matches, current, deco };
@@ -164,7 +204,8 @@ const focus = new Plugin({
 });
 
 // ------------------------------------------------------------------------------------------
-// Word completion (offers long words already used in the document; Tab or Enter accepts)
+// Word completion (offers long words already used in the document; Tab accepts, Esc dismisses,
+// Enter is left alone so a new paragraph never picks up the suggestion)
 
 export const completeKey = new PluginKey<{ suggestion: string | null; pos: number; prefix: string }>('complete');
 
@@ -211,7 +252,7 @@ function completion(enabled: () => boolean) {
           const el = document.createElement('span');
           el.className = 'qf-complete';
           el.textContent = s.suggestion!;
-          el.title = 'Tab or Enter to accept';
+          el.title = 'Tab to accept, Esc to dismiss';
           el.addEventListener('mousedown', (e) => { e.preventDefault(); });
           return el;
         }, { side: 1, key: 'complete-' + s.suggestion })]);
@@ -219,7 +260,7 @@ function completion(enabled: () => boolean) {
       handleKeyDown(view, e) {
         const s = completeKey.getState(view.state);
         if (!s?.suggestion) return false;
-        if (e.key === 'Tab' || e.key === 'Enter') {
+        if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
           e.preventDefault();
           view.dispatch(view.state.tr.insertText(s.suggestion, s.pos).setMeta(completeKey, 'clear'));
           return true;
@@ -351,25 +392,47 @@ function computeCoach(doc: PMNode) {
   const decos: Decoration[] = [];
   doc.descendants((node, pos) => {
     if (!node.isTextblock || node.type.spec.code) return true;
-    const text = node.textBetween(0, node.content.size, '￼', '￼');
-    const base = pos + 1;
-    // sentences
-    const sentRe = /[^.!?]+[.!?]*/g;
-    let m: RegExpExecArray | null;
-    while ((m = sentRe.exec(text))) {
-      const words = (m[0].match(/[\p{L}\p{N}']+/gu) || []).length;
-      if (words >= 30) decos.push(Decoration.inline(base + m.index, base + m.index + m[0].length, { class: 'qf-coach-vlong', title: `Very long sentence (${words} words)` }));
-      else if (words >= 21) decos.push(Decoration.inline(base + m.index, base + m.index + m[0].length, { class: 'qf-coach-long', title: `Long sentence (${words} words)` }));
-    }
-    const adv = /\b(\w{3,}ly)\b/g;
-    while ((m = adv.exec(text))) if (!ADVERB_EXCEPT.has(m[1].toLowerCase())) decos.push(Decoration.inline(base + m.index, base + m.index + m[1].length, { class: 'qf-coach-adverb', title: 'Adverb' }));
-    WEAK.lastIndex = 0;
-    while ((m = WEAK.exec(text))) decos.push(Decoration.inline(base + m.index, base + m.index + m[0].length, { class: 'qf-coach-weak', title: 'Weak or wordy phrase' }));
-    PASSIVE.lastIndex = 0;
-    while ((m = PASSIVE.exec(text))) decos.push(Decoration.inline(base + m.index, base + m.index + m[0].length, { class: 'qf-coach-passive', title: 'Possible passive voice' }));
+    coachBlock(node, pos, decos);
     return false;
   });
   return DecorationSet.create(doc, decos);
+}
+
+/** Recompute coach marks only in the textblocks a transaction touched. */
+function updateCoach(tr: Transaction, deco: DecorationSet): DecorationSet {
+  let d = deco.map(tr.mapping, tr.doc);
+  const seen = new Set<number>();
+  const add: Decoration[] = [];
+  for (const r of changedRanges(tr)) {
+    tr.doc.nodesBetween(Math.max(0, r.from), Math.min(tr.doc.content.size, r.to), (node, pos) => {
+      if (!node.isTextblock) return true;
+      if (seen.has(pos)) return false;
+      seen.add(pos);
+      d = d.remove(d.find(pos, pos + node.nodeSize));
+      if (!node.type.spec.code) coachBlock(node, pos, add);
+      return false;
+    });
+  }
+  return add.length ? d.add(tr.doc, add) : d;
+}
+
+function coachBlock(node: PMNode, pos: number, decos: Decoration[]): void {
+  const text = node.textBetween(0, node.content.size, '￼', '￼');
+  const base = pos + 1;
+  // sentences
+  const sentRe = /[^.!?]+[.!?]*/g;
+  let m: RegExpExecArray | null;
+  while ((m = sentRe.exec(text))) {
+    const words = (m[0].match(/[\p{L}\p{N}']+/gu) || []).length;
+    if (words >= 30) decos.push(Decoration.inline(base + m.index, base + m.index + m[0].length, { class: 'qf-coach-vlong', title: `Very long sentence (${words} words)` }));
+    else if (words >= 21) decos.push(Decoration.inline(base + m.index, base + m.index + m[0].length, { class: 'qf-coach-long', title: `Long sentence (${words} words)` }));
+  }
+  const adv = /\b(\w{3,}ly)\b/g;
+  while ((m = adv.exec(text))) if (!ADVERB_EXCEPT.has(m[1].toLowerCase())) decos.push(Decoration.inline(base + m.index, base + m.index + m[1].length, { class: 'qf-coach-adverb', title: 'Adverb' }));
+  WEAK.lastIndex = 0;
+  while ((m = WEAK.exec(text))) decos.push(Decoration.inline(base + m.index, base + m.index + m[0].length, { class: 'qf-coach-weak', title: 'Weak or wordy phrase' }));
+  PASSIVE.lastIndex = 0;
+  while ((m = PASSIVE.exec(text))) decos.push(Decoration.inline(base + m.index, base + m.index + m[0].length, { class: 'qf-coach-passive', title: 'Possible passive voice' }));
 }
 
 const coach = new Plugin({
@@ -380,7 +443,8 @@ const coach = new Plugin({
       const meta = tr.getMeta(coachKey);
       const on = meta !== undefined ? !!meta : v.on;
       if (!on) return { on, deco: DecorationSet.empty };
-      if (meta !== undefined || tr.docChanged) return { on, deco: computeCoach(tr.doc) };
+      if (meta !== undefined || !v.on) return { on, deco: computeCoach(tr.doc) };
+      if (tr.docChanged) return { on, deco: updateCoach(tr, v.deco) };
       return v;
     },
   },
