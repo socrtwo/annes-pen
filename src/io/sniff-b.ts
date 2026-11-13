@@ -92,6 +92,30 @@ export function zipMimetype(u8: Uint8Array): string | null {
   return s.trim();
 }
 
+/**
+ * Index of the first character after leading whitespace, a BOM, processing instructions
+ * (<?xml …?>), comments and, when `doctype` is set, a doctype. Linear: an unterminated
+ * construct ends the scan.
+ */
+export function skipProlog(t: string, doctype = true): number {
+  let i = 0;
+  for (;;) {
+    while (i < t.length && (t.charCodeAt(i) <= 32 || t.charCodeAt(i) === 0xfeff)) i++;
+    if (t.startsWith('<?', i)) { const e = t.indexOf('?>', i + 2); if (e < 0) return t.length; i = e + 2; continue; }
+    if (t.startsWith('<!--', i)) { const e = t.indexOf('-->', i + 4); if (e < 0) return t.length; i = e + 3; continue; }
+    if (doctype && t.slice(i, i + 9).toLowerCase() === '<!doctype') {
+      const gt = t.indexOf('>', i + 9), br = t.indexOf('[', i + 9);
+      // An internal subset ([…]) may contain '>'.
+      const from = br >= 0 && (gt < 0 || br < gt) ? t.indexOf(']', br) : i + 9;
+      const e = from < 0 ? -1 : t.indexOf('>', from);
+      if (e < 0) return t.length;
+      i = e + 1;
+      continue;
+    }
+    return i;
+  }
+}
+
 /** Root element local name and the first ~4 KB of text of an XML document (BOM/UTF-16 aware). */
 export function xmlRoot(u8: Uint8Array): { root: string; prefix: string; head: string } | null {
   const head = headText(u8, 8192);
@@ -99,7 +123,7 @@ export function xmlRoot(u8: Uint8Array): { root: string; prefix: string; head: s
   if (!body.startsWith('<')) return null;
   const re = /<([A-Za-z_][\w.-]*:)?([A-Za-z_][\w.-]*)[\s>/]/g;
   // Skip declarations, processing instructions, comments and the doctype.
-  const stripped = body.replace(/<\?[\s\S]*?\?>/g, '').replace(/<!--[\s\S]*?-->/g, '').replace(/<!DOCTYPE[^[>]*(\[[\s\S]*?\])?\s*>/i, '');
+  const stripped = body.slice(skipProlog(body));
   re.lastIndex = 0;
   const m = re.exec(stripped);
   if (!m) return null;
@@ -221,7 +245,8 @@ export function detectRtfd(u8: Uint8Array, name: string): number {
 
 export function detectMhtml(u8: Uint8Array, name: string): number {
   const h = headText(u8, 8192);
-  if (!/^(?:[\w-]+:[^\n]*\r?\n(?:[ \t][^\n]*\r?\n)*)*?Content-Type:\s*multipart\/related/im.test(h.replace(/^\s+/, ''))) {
+  // (A header line anywhere in the head; the old nested pattern matched the same and was exponential.)
+  if (!/^Content-Type:\s*multipart\/related/im.test(h.replace(/^\s+/, ''))) {
     return ['mht', 'mhtml'].includes(extOf(name)) && /Content-Type:\s*multipart\//i.test(h) ? 0.8 : 0;
   }
   return /text\/html|application\/xhtml/i.test(headText(u8, 65536)) ? 1 : 0.6;
@@ -263,7 +288,7 @@ export function detectTextile(u8: Uint8Array, name: string): number {
   if (!textish(u8)) return 0;
   if (extOf(name) === 'textile') return 1;
   const h = headText(u8, 16384);
-  const hits = (h.match(/^(h[1-6]|p|bq|bc|fn\d+)(\([^)]*\)|\{[^}]*\}|[<>=]+)*\. /gm) || []).length;
+  const hits = (h.match(/^(h[1-6]|p|bq|bc|fn\d+)(\([^)]*\)|\{[^}]*\}|[<>=])*\. /gm) || []).length;
   return hits >= 2 ? 0.6 : 0;
 }
 
@@ -294,7 +319,12 @@ export function detectTroff(u8: Uint8Array, name: string): number {
   const ext = extOf(name);
   const h = headText(u8, 16384);
   const req = (h.match(/^\.(TH|SH|SS|PP|LP|TP|IP|B|I|BR|RB|IR|RI|nf|fi|br|sp|Dd|Dt|Os|Sh|Nm|Nd|Pp|\\")\b/gm) || []).length;
-  if (/^(man|[1-9n]|[1-9][a-z]+|mdoc|roff|tr|ms|me|mm|t)$/.test(ext)) return req >= 1 ? 1 : 0.5;
+  if (/^(man|mdoc|roff)$/.test(ext)) return req >= 1 ? 1 : 0.5;
+  // Extensions that plain text uses too (.1, .me, .t, .n …): require request lines.
+  if (/^([1-9n]|[1-9][a-z]+|tr|ms|me|mm|t)$/.test(ext)) {
+    const any = (h.match(/^\.(?:[A-Za-z][A-Za-z0-9]?|\\")(?=[ \t]|\r?$)/gm) || []).length;
+    return req >= 1 ? 1 : any >= 2 ? 0.7 : 0;
+  }
   if (/^\.TH\s+\S+/m.test(h) || /^\.Dd\s/m.test(h)) return req >= 3 ? 0.9 : 0.6;
   return req >= 5 ? 0.5 : 0;
 }

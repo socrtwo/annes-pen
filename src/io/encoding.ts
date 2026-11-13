@@ -68,8 +68,37 @@ const LONE_WORDS = new Set([...'àéèóòùíúåöäüçâêôýáųąęłАа
 const isLower = (c: string) => c !== c.toUpperCase() && c === c.toLowerCase();
 const isUpper = (c: string) => c !== c.toLowerCase() && c === c.toUpperCase();
 
+const asciiAlnum = (x: number) => (x >= 0x30 && x <= 0x39) || (x >= 0x41 && x <= 0x5a) || (x >= 0x61 && x <= 0x7a);
+const blank = (x: number | undefined) => x === undefined || x === 0x20 || x === 0x09 || x === 0x0a || x === 0x0d;
+
+/**
+ * Share of the high bytes that are Windows punctuation (0x85, 0x91–0x97) placed the way
+ * typography places it: apostrophes in or at the edge of words, quotes opening and closing
+ * words, dashes between words, an ellipsis after a word.
+ */
+function cp1252Typography(u8: Uint8Array): number {
+  let high = 0, typo = 0;
+  for (let i = 0; i < u8.length; i++) {
+    const b = u8[i];
+    if (b < 0x80) continue;
+    high++;
+    if (b !== 0x85 && (b < 0x91 || b > 0x97 || b === 0x95)) continue;
+    const p = i ? u8[i - 1] : undefined, n = u8[i + 1];
+    const lp = p !== undefined && asciiAlnum(p), ln = n !== undefined && asciiAlnum(n);
+    const closeP = p !== undefined && (lp || p === 0x2e || p === 0x2c || p === 0x21 || p === 0x3f || p === 0x85 || p === 0x92);
+    let ok = false;
+    if (b === 0x92) ok = lp || ln; // it’s, James’, ’90s
+    else if (b === 0x91 || b === 0x93) ok = !lp && (ln || n === 0x91); // ‘opening, “opening
+    else if (b === 0x94) ok = closeP && !ln; // closing”
+    else if (b === 0x96 || b === 0x97) ok = (blank(p) || lp) && (blank(n) || ln);
+    else if (b === 0x85) ok = (closeP || blank(p)) && (blank(n) || n === 0x94 || n === 0x92 || n === 0x22 || n === 0x27);
+    if (ok) typo++;
+  }
+  return high ? typo / high : 0;
+}
+
 /** Plausibility of decoded single-byte text (higher is better); null when nothing non-ASCII. */
-function scoreSingle(s: string, label: string): number | null {
+function scoreSingle(s: string, label: string, typography = 0): number | null {
   let high = 0, score = 0;
   let cyrLower = 0, cyrUpper = 0;
   for (let i = 0; i < s.length; i++) {
@@ -107,6 +136,8 @@ function scoreSingle(s: string, label: string): number | null {
   if (cyrLower + cyrUpper > 4) norm += ((cyrLower - cyrUpper) / (cyrLower + cyrUpper)) * ((cyrLower + cyrUpper) / high); // prose is mostly lower case
   // Gentle priors: Windows-1252 is the most common legacy encoding; MacRoman/DOS need evidence.
   if (label === 'windows-1252') norm += 0.15;
+  // Smart quotes, apostrophes and dashes are the same in every Windows code page.
+  if (label.startsWith('windows-')) norm += 3 * typography;
   if (label === 'iso-8859-2') norm -= 0.05;
   if (label === 'cp850') norm -= 0.02;
   return norm;
@@ -130,10 +161,82 @@ function scoreMulti(s: string, label: string): number {
   if (label === 'euc-kr') score += hangul ? 0.3 : -0.3;
   if (label === 'gbk') score += han ? (sc / han) * 0.6 - 0.05 : -0.2;
   if (label === 'big5') score += han ? (tc / han) * 0.6 - 0.1 : -0.2;
+  // Chinese prose is full of the most frequent characters; rare ones only are a misread.
+  if ((label === 'gbk' || label === 'big5') && han >= 3 && !kana && !hangul && (label === 'gbk' ? sc : tc) < han * 0.1) score -= 0.5;
   return score;
 }
 
 export interface Detected { encoding: string; text: string; confidence: number }
+
+/** Script ranges real text is written in (a code unit outside all of them is suspect). */
+const BLOCKS: [number, number][] = [
+  [0x0000, 0x007f], [0x0080, 0x024f], [0x0250, 0x036f], [0x0370, 0x03ff], [0x0400, 0x052f], [0x0530, 0x058f], [0x0590, 0x05ff], [0x0600, 0x06ff],
+  [0x0900, 0x0dff], [0x0e00, 0x0e7f], [0x1e00, 0x1fff], [0x2000, 0x206f], [0x2100, 0x21ff], [0x2500, 0x25ff], [0x3000, 0x30ff], [0x3100, 0x31ff],
+  [0x4e00, 0x9fff], [0xac00, 0xd7af], [0xff00, 0xffef],
+];
+const HAN_BLOCK = 16;
+
+function blockOf(u: number): number {
+  for (let k = 0; k < BLOCKS.length; k++) if (u >= BLOCKS[k][0] && u <= BLOCKS[k][1]) return k;
+  return -1;
+}
+
+/** True when the bytes decode as UTF-8 (a sequence cut at the end is allowed). */
+function utf8Valid(u8: Uint8Array): boolean {
+  let end = u8.length;
+  let k = 0;
+  while (k < 3 && end > 0 && (u8[end - 1] & 0xc0) === 0x80) { end--; k++; }
+  if (end > 0 && u8[end - 1] >= 0xc0) end--;
+  else end = u8.length;
+  try { new TextDecoder('utf-8', { fatal: true }).decode(u8.subarray(0, end)); return true; } catch { return false; }
+}
+
+/** How well UTF-16 code units read as text: 0 when invalid, else the share in the three main scripts. */
+function utf16Score(u8: Uint8Array, le: boolean): number {
+  const n = Math.min(u8.length, 8192) & ~1;
+  const counts = new Array<number>(BLOCKS.length).fill(0);
+  let chars = 0, bad = 0, common = 0;
+  for (let i = 0; i < n; i += 2) {
+    const u = le ? u8[i] | (u8[i + 1] << 8) : (u8[i] << 8) | u8[i + 1];
+    chars++;
+    if (u >= 0xd800 && u <= 0xdbff) {
+      const v = i + 3 < n ? (le ? u8[i + 2] | (u8[i + 3] << 8) : (u8[i + 2] << 8) | u8[i + 3]) : i + 2 >= n ? 0xdc00 : 0;
+      if (v < 0xdc00 || v > 0xdfff) return 0; // unpaired surrogate
+      i += 2;
+      continue;
+    }
+    if (u >= 0xdc00 && u <= 0xdfff) return 0;
+    if (u === 9 || u === 10 || u === 13 || u === 12) { counts[0]++; continue; }
+    const k = u < 0x20 || (u >= 0x7f && u < 0xa0) ? -1 : blockOf(u);
+    if (k < 0) { bad++; continue; }
+    counts[k]++;
+    if (k === HAN_BLOCK) { const c = String.fromCharCode(u); if (COMMON_SC.includes(c) || COMMON_TC.includes(c)) common++; }
+  }
+  if (chars < 2 || bad > chars * 0.02) return 0;
+  // Bytes of other text read as UTF-16 land on random, mostly rare ideographs.
+  const han = counts[HAN_BLOCK];
+  if (han > chars * 0.2 && common < han * 0.15) return 0;
+  const top = [...counts].sort((a, b) => b - a);
+  const share = (top[0] + top[1] + top[2]) / chars;
+  return share >= 0.9 ? share : 0;
+}
+
+/**
+ * BOM-less UTF-16 whose text is not mostly ASCII (so the zero-byte pattern does not show it):
+ * tried only when the bytes are not UTF-8, or decode as UTF-8 full of control characters.
+ */
+export function bomlessUtf16(u8: Uint8Array): 'utf-16le' | 'utf-16be' | null {
+  if (u8.length < 4 || u8.length % 2) return null;
+  const sample = u8.subarray(0, Math.min(u8.length, 8192));
+  if (utf8Valid(sample)) {
+    let ctrl = 0;
+    for (const x of sample) if (x < 0x20 && x !== 9 && x !== 10 && x !== 13 && x !== 12) ctrl++;
+    if (ctrl <= sample.length * 0.01) return null;
+  }
+  const le = utf16Score(u8, true), be = utf16Score(u8, false);
+  if (!le && !be) return null;
+  return le >= be ? 'utf-16le' : 'utf-16be';
+}
 
 /** Detect the encoding of text bytes and decode them. */
 export function detectText(data: ArrayBuffer | Uint8Array): Detected {
@@ -152,6 +255,8 @@ export function detectText(data: ArrayBuffer | Uint8Array): Detected {
     if (odd / pairs > 0.3 && even / pairs < 0.05) return { encoding: 'utf-16le', text: new TextDecoder('utf-16le').decode(u8), confidence: 0.9 };
     if (even / pairs > 0.3 && odd / pairs < 0.05) return { encoding: 'utf-16be', text: new TextDecoder('utf-16be').decode(u8), confidence: 0.9 };
   }
+  const u16 = bomlessUtf16(u8);
+  if (u16) return { encoding: u16, text: new TextDecoder(u16).decode(u8), confidence: 0.85 };
   const utf8 = decodeAs(u8, 'utf-8', true);
   if (utf8 != null) return { encoding: 'utf-8', text: utf8, confidence: 1 };
   // A file truncated in the middle of a UTF-8 sequence is still UTF-8.
@@ -161,10 +266,12 @@ export function detectText(data: ArrayBuffer | Uint8Array): Detected {
   }
   const probe = u8.subarray(0, Math.min(u8.length, 65536));
   let best: { encoding: string; score: number } = { encoding: 'windows-1252', score: -Infinity };
-  // Bytes ≥ 0x80 followed by bytes ≥ 0x40 in pairs suggest a double-byte encoding.
+  // Bytes ≥ 0x80 followed by bytes ≥ 0x40 in pairs suggest a double-byte encoding, unless the
+  // high bytes are Windows smart quotes and dashes ("Don’t" is 'n' 0x92 't', a valid GBK pair).
   let pairs = 0, highs = 0;
-  for (let i = 0; i < probe.length; i++) if (probe[i] >= 0x80) { highs++; if (probe[i + 1] >= 0x40) { pairs++; i++; } }
-  if (pairs > 2 && pairs * 2 >= highs * 0.9) {
+  for (let i = 0; i < probe.length; i++) if (probe[i] >= 0x80) { highs++; if (probe[i + 1] >= 0x40 && probe[i + 1] !== 0x7f && probe[i + 1] !== 0xff) { pairs++; i++; } }
+  const typography = cp1252Typography(probe);
+  if (pairs > 2 && pairs * 2 >= highs * 0.9 && typography < 0.5) {
     for (const enc of MULTI_BYTE) {
       const s = decodeAs(probe.length < u8.length ? trimPartial(probe) : probe, enc, true);
       if (s == null) continue;
@@ -176,7 +283,7 @@ export function detectText(data: ArrayBuffer | Uint8Array): Detected {
     for (const enc of SINGLE_BYTE) {
       const s = decodeAs(probe, enc);
       if (s == null) continue;
-      const sc = scoreSingle(s, enc);
+      const sc = scoreSingle(s, enc, typography);
       if (sc != null && sc > best.score) best = { encoding: enc, score: sc };
     }
   }

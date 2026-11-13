@@ -8,10 +8,12 @@
 import type { Node as PMNode } from 'prosemirror-model';
 import type { RecoveryReport } from './recover';
 import { normalizeTables } from '../editor/normalize';
-import { sniff, registerSniffer, type SniffCategory, type SniffResult } from './sniff';
+import { sniff, registerSniffer, PLAIN_TEXT_EXTS, type SniffCategory, type SniffResult } from './sniff';
 import { LEGACY_FORMATS } from './formats-legacy';
 import { FORMATS_B } from './formats-b';
 import { snifferRulesB } from './sniff-b';
+import { decodeAuto } from './encoding';
+import { ZipLimitError } from './zip';
 
 export { sniff, registerSniffer, sniffRules, type SniffResult, type SniffRule, type SniffCategory } from './sniff';
 
@@ -144,8 +146,12 @@ export function sniffFormat(data: ArrayBuffer, name: string): FormatDef | undefi
 /** The importer for a sniff result: the detected format, else the extension's, else plain text for text. */
 export function formatForSniff(s: SniffResult, name: string): FormatDef | undefined {
   const byId = formatById(s.format);
-  if (byId?.canImport) return byId;
   const byName = formatForName(name);
+  // A .txt name beats a guess: extension-only results and light-markup/table guesses below 0.8
+  // (only a binary or container signature overrides a plain-text extension).
+  const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : '';
+  if (byName?.id === 'txt' && PLAIN_TEXT_EXTS.includes(ext) && s.format !== 'txt' && (s.confidence < 0.3 || (s.confidence < 0.8 && TEXTUAL.includes(s.format)))) return byName;
+  if (byId?.canImport) return byId;
   if (s.confidence < 0.3 && byName?.canImport) return byName;
   if (s.format === 'txt' || s.format === 'unknown') return byName?.canImport && s.format === 'unknown' ? byName : s.format === 'txt' ? formatById('txt') : undefined;
   return undefined;
@@ -161,6 +167,9 @@ export interface ImportResult {
   /** Short note for the user, e.g. when the file name's extension disagreed with the content. */
   note?: string;
 }
+
+/** Formats detected from text heuristics only. */
+const TEXTUAL = ['md', 'rst', 'textile', 'asciidoc', 'org', 'man', 'latex', 'csv', 'tsv', 'html', 'mbox', 'eml', 'sam', 't602'];
 
 /** Formats whose damaged files go through the recovery pipeline instead of failing. */
 const RECOVERABLE = ['docx', 'doc', 'odt', 'rtf', 'epub', 'fodt', ...LEGACY_FORMATS.filter((f) => !f.category).map((f) => f.id)];
@@ -196,7 +205,13 @@ async function importRaw(data: ArrayBuffer, name: string, opts: ImportOptions, s
   try {
     doc = await fmt.import(data, name);
   } catch (e) {
-    if (!RECOVERABLE.includes(fmt.id)) throw e;
+    // A package over the size limits must not be inflated again by the salvage readers.
+    if (e instanceof ZipLimitError) throw e;
+    if (!RECOVERABLE.includes(fmt.id)) {
+      const asText = await textFallback(data, fmt, e);
+      if (asText) return asText;
+      throw e;
+    }
     return recover(e, false);
   }
   // A package that "opens" but yields nothing from a sizable file is usually damaged inside.
@@ -210,8 +225,27 @@ async function importRaw(data: ArrayBuffer, name: string, opts: ImportOptions, s
   return { doc, format: fmt };
 }
 
+/** A file whose importer failed but whose bytes are readable text opens as plain text, with a note. */
+async function textFallback(data: ArrayBuffer, fmt: FormatDef, cause: unknown): Promise<ImportResult | null> {
+  if (fmt.id === 'txt' || !data.byteLength) return null;
+  const text = decodeAuto(new Uint8Array(data, 0, Math.min(data.byteLength, 65536)));
+  let ok = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if ((c >= 0x20 && c !== 0x7f && c !== 0xfffd && (c < 0x80 || c >= 0xa0)) || c === 9 || c === 10 || c === 13 || c === 12) ok++;
+  }
+  if (!text.length || ok < text.length * 0.95) return null;
+  const txt = formatById('txt')!;
+  const doc = await txt.import!(data, 'text.txt');
+  const why = friendlyOpenError(cause instanceof Error ? cause.message : String(cause)).replace(/\.$/, '');
+  return { doc, format: txt, note: `Could not read as ${fmt.label}: ${why}; opened as plain text.` };
+}
+
 /** Translate low-level ZIP/inflate errors into plain language for the recovery report. */
 export function friendlyOpenError(msg: string): string {
+  // JSZip: "End of data reached (data length = …)", "Corrupted zip: missing 12 bytes", "Corrupted zip: can't find end of central directory".
+  if (/end of data reached|corrupted zip ?:? ?missing|corrupted zip \?/i.test(msg)) return 'the file is cut short or its ZIP structure is damaged.';
+  if (/corrupted zip.*central directory|can't find end of central/i.test(msg)) return 'the file\'s table of contents (ZIP central directory) is missing or damaged.';
   if (/size mismatch|invalid (distance|code|block|stored)|too far back|incorrect header|unexpected end|crc32|corrupt/i.test(msg)) return 'compressed data inside the file is damaged.';
   if (/end of central directory|is this a zip/i.test(msg)) return 'the file\'s table of contents (ZIP central directory) is missing or damaged.';
   if (/document\.xml is missing or unreadable/i.test(msg)) return 'the main document part could not be read.';
@@ -230,13 +264,7 @@ export async function exportFile(doc: PMNode, formatId: string, opts: ExportOpti
   return fmt.export(normalizeTables(doc), opts);
 }
 
+/** Decode text bytes (BOM, UTF-16, UTF-8, then the legacy code page detector). */
 export function decodeText(data: ArrayBuffer): string {
-  const u8 = new Uint8Array(data);
-  if (u8[0] === 0xff && u8[1] === 0xfe) return new TextDecoder('utf-16le').decode(u8.slice(2));
-  if (u8[0] === 0xfe && u8[1] === 0xff) return new TextDecoder('utf-16be').decode(u8.slice(2));
-  try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(u8);
-  } catch {
-    return new TextDecoder('windows-1252').decode(u8);
-  }
+  return decodeAuto(data);
 }

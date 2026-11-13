@@ -12,6 +12,8 @@
  */
 import { openCfb, type Cfb } from './cfb';
 import { immortalInflate } from './recover/inflate';
+import { bomlessUtf16 } from './encoding';
+import { skipProlog } from './sniff-b';
 
 export type SniffCategory = 'document' | 'spreadsheet' | 'presentation' | 'email' | 'unknown';
 
@@ -72,6 +74,9 @@ export interface SniffContext {
 // ---------------------------------------------------------------------------------------
 // Context
 
+/** Largest declared size of a ZIP entry the sniffer inflates (it reads at most a prefix). */
+const SNIFF_MAX_ENTRY = 16 * 1024 * 1024;
+
 function zipIndex(b: Uint8Array): ZipIndex | null {
   if (b.length < 22 || b[0] !== 0x50 || b[1] !== 0x4b) return null;
   const u16 = (o: number) => b[o] | (b[o + 1] << 8);
@@ -101,21 +106,34 @@ function zipIndex(b: Uint8Array): ZipIndex | null {
   }
   if (!entries.length) return null;
   const byName = new Map(entries.map((e) => [e.name.toLowerCase(), e]));
+  // Rules read the same small parts again and again: inflate each once (the longest prefix asked for).
+  const cache = new Map<string, { max: number; data: Uint8Array | null }>();
+  const readRaw = (e: ZipEntry, max: number): Uint8Array | null => {
+    if (e.offset + 30 > b.length || u32(e.offset) !== 0x04034b50) return null;
+    const start = e.offset + 30 + u16(e.offset + 26) + u16(e.offset + 28);
+    const cs = Math.min(e.csize || b.length - start, b.length - start);
+    const raw = b.subarray(start, start + cs);
+    if (e.method === 0) return raw.subarray(0, Math.min(raw.length, max));
+    if (e.method === 8) {
+      try { return immortalInflate(raw.subarray(0, Math.min(raw.length, max)), { maxOutput: max }).data.subarray(0, max); } catch { return null; }
+    }
+    return null;
+  };
   return {
     names: entries.map((e) => e.name),
     has: (n) => byName.has(n.toLowerCase()),
     find: (re) => entries.find((e) => re.test(e.name))?.name,
     read(n, max = 1 << 20) {
-      const e = byName.get(n.toLowerCase());
-      if (!e || e.offset + 30 > b.length || u32(e.offset) !== 0x04034b50) return null;
-      const start = e.offset + 30 + u16(e.offset + 26) + u16(e.offset + 28);
-      const cs = Math.min(e.csize || b.length - start, b.length - start);
-      const raw = b.subarray(start, start + cs);
-      if (e.method === 0) return raw.subarray(0, Math.min(raw.length, max));
-      if (e.method === 8) {
-        try { return immortalInflate(raw.subarray(0, Math.min(raw.length, max))).data.subarray(0, max); } catch { return null; }
-      }
-      return null;
+      const key = n.toLowerCase();
+      const e = byName.get(key);
+      // Sniffing needs only a prefix; an entry that claims to be huge is not worth inflating.
+      if (!e || e.size > SNIFF_MAX_ENTRY) return null;
+      max = Math.min(max, SNIFF_MAX_ENTRY);
+      const hit = cache.get(key);
+      if (hit && hit.max >= max) return hit.data && hit.data.subarray(0, max);
+      const data = readRaw(e, max);
+      cache.set(key, { max, data });
+      return data;
     },
   };
 }
@@ -132,6 +150,9 @@ function detectText(b: Uint8Array): { text: string; encoding: string } {
   for (let i = 0; i < m; i++) if (!s[i]) { if (i % 2) zOdd++; else zEven++; }
   if (m >= 16 && zOdd > m * 0.35 && zEven < m * 0.05) return { text: new TextDecoder('utf-16le').decode(s.subarray(0, n - (n % 2))), encoding: 'utf-16le' };
   if (m >= 16 && zEven > m * 0.35 && zOdd < m * 0.05) return { text: new TextDecoder('utf-16be').decode(s.subarray(0, n - (n % 2))), encoding: 'utf-16be' };
+  // UTF-16 of non-Latin text (Cyrillic, CJK) has few zero bytes: validate it as UTF-16 instead.
+  const u16 = bomlessUtf16(s);
+  if (u16) return { text: new TextDecoder(u16).decode(s.subarray(0, n - (n % 2))), encoding: u16 };
   try {
     // A multi-byte sequence may be cut at the 64 KB boundary.
     let end = n;
@@ -180,8 +201,8 @@ export function makeContext(data: ArrayBuffer | Uint8Array, name: string): Sniff
       if (root === undefined) {
         root = null;
         if (!ctx.binary()) {
-          const t = ctx.text().slice(0, 16384).replace(/<\?[\s\S]*?\?>|<!--[\s\S]*?-->|<!DOCTYPE[^>[]*(\[[\s\S]*?\])?\s*>/gi, '');
-          const m = /^\s*<([A-Za-z_][\w.-]*:)?([A-Za-z_][\w.-]*)([^>]*)>/.exec(t);
+          const t = ctx.text().slice(0, 16384);
+          const m = /^<([A-Za-z_][\w.-]*:)?([A-Za-z_][\w.-]*)(?=[\s/>])([^>]*)>/.exec(t.slice(skipProlog(t)));
           if (m) root = { prefix: (m[1] || '').replace(':', ''), name: m[2], ns: [...m[3].matchAll(/xmlns(?::[\w.-]+)?\s*=\s*["']([^"']*)["']/g)].map((x) => x[1]), raw: m[0] };
         }
       }
@@ -197,7 +218,7 @@ export function makeContext(data: ArrayBuffer | Uint8Array, name: string): Sniff
           if (flg & 8) { while (p < bytes.length && bytes[p]) p++; p++; }
           if (flg & 16) { while (p < bytes.length && bytes[p]) p++; p++; }
           if (flg & 2) p += 2;
-          try { gz = immortalInflate(bytes.subarray(p, Math.min(bytes.length, p + max))).data.subarray(0, max); } catch { gz = null; }
+          try { gz = immortalInflate(bytes.subarray(p, Math.min(bytes.length, p + max)), { maxOutput: max }).data.subarray(0, max); } catch { gz = null; }
         }
       }
       return gz;
@@ -281,9 +302,22 @@ function wpc(c: SniffContext, b = c.bytes): { product: number; type: number; maj
   return { product: b[8], type: b[9], major: b[10], minor: b[11] };
 }
 
+/** True when the bytes are valid UTF-8 with at least one multi-byte sequence (accented text, not codes). */
+function utf8Multibyte(b: Uint8Array): boolean {
+  let end = b.length, k = 0;
+  while (k < 3 && end > 0 && (b[end - 1] & 0xc0) === 0x80) { end--; k++; }
+  if (end > 0 && b[end - 1] >= 0xc0) end--; else end = b.length;
+  const s = b.subarray(0, end);
+  if (!s.some((x) => x >= 0x80)) return false;
+  try { new TextDecoder('utf-8', { fatal: true }).decode(s); return true; } catch { return false; }
+}
+
+const asciiLetter = (x: number | undefined) => x !== undefined && ((x >= 0x41 && x <= 0x5a) || (x >= 0x61 && x <= 0x7a));
+
 /** WordPerfect 4.2 (no header): function codes 0xC0-0xFE are bracketed by the same code. */
 export function wp42Score(b: Uint8Array): number {
   const n = Math.min(b.length, 8192);
+  if (utf8Multibyte(b.subarray(0, n))) return 0;
   let good = 0, bad = 0, text = 0;
   for (let i = 0; i < n; ) {
     const c = b[i];
@@ -293,8 +327,15 @@ export function wp42Score(b: Uint8Array): number {
     if (c >= 0xc0 && c < 0xff) {
       // A run of one repeated byte (DOS box-drawing lines) is text, not a bracketed code.
       if (b[i + 1] === c) { let j = i; while (j < n && b[j] === c) j++; bad++; i = j; continue; }
+      // A high byte inside a word is an accented letter (Latin-1 "Hélas"), not a code.
+      if (asciiLetter(b[i - 1]) && asciiLetter(b[i + 1])) { bad++; i++; continue; }
       const end = b.indexOf(c, i + 2);
-      if (end > 0 && end - i < 300) { good++; i = end + 1; continue; }
+      if (end > 0 && end - i < 300) {
+        // A code holds a few parameter bytes; a stretch of words between two "é" is prose.
+        const inner = b.subarray(i + 1, end);
+        const prose = inner.every((x) => (x >= 0x20 && x < 0x7f) || x >= 0xc0) && (inner.includes(0x20) || inner.length > 8);
+        if (!prose) { good++; i = end + 1; continue; }
+      }
     }
     bad++; i++;
   }
@@ -307,18 +348,25 @@ export function wordstarScore(c: SniffContext): number {
   const b = c.bytes;
   if (b[0] === 0x1d && b[1] === 0x7d) return 0.85; // WordStar 5-7 document header
   const n = Math.min(b.length, 16384);
-  let hi = 0, soft = 0, ctrl = 0, letters = 0, zero = 0;
+  if (utf8Multibyte(b.subarray(0, n))) return 0;
+  let hi = 0, mid = 0, soft = 0, ctrl = 0, letters = 0, zero = 0, words = 0;
   for (let i = 0; i < n; i++) {
     const x = b[i];
     if (x === 0) zero++;
+    if (x === 0x20) words++;
     if (x >= 0xa1 && x <= 0xfa && (b[i + 1] === 0x20 || b[i + 1] === 0x0d || b[i + 1] === 0x8d || b[i + 1] === 0xa0) && ((x & 0x7f) >= 0x61 || ((x & 0x7f) >= 0x2c && (x & 0x7f) <= 0x3f))) hi++;
+    // WordStar sets the high bit only on the last letter of a word; Latin-1 accents sit inside words too.
+    if (x >= 0xc0 && asciiLetter(b[i - 1]) && asciiLetter(b[i + 1])) mid++;
     if (x === 0x8d && b[i + 1] === 0x0a) soft++;
     if (x === 0x02 || x === 0x13 || x === 0x19 || x === 0x14 || x === 0x16) ctrl++;
     if ((x >= 0x61 && x <= 0x7a) || (x >= 0x41 && x <= 0x5a)) letters++;
   }
   if (zero > n * 0.01 || letters < n * 0.3) return 0;
   const dots = (c.head.match(/(^|\r\n|\n)\.(pa|op|he|fo|lm|rm|pl|mt|mb|po|cw|lh|pn|cp|ig|\.\.)/gi) || []).length;
-  const s = (hi > 3 ? 0.3 : 0) + (soft > 1 ? 0.3 : 0) + (dots > 0 ? 0.25 : 0) + (ctrl > 1 ? 0.1 : 0);
+  // High-bit word endings alone are what accented text looks like: require WordStar's own codes.
+  if (soft < 2 && dots === 0 && ctrl < 2) return 0;
+  const hiOk = hi > 3 && mid * 2 < hi && hi >= words * 0.15;
+  const s = (hiOk ? 0.3 : 0) + (soft > 1 ? 0.3 : 0) + (dots > 0 ? 0.25 : 0) + (ctrl > 1 ? 0.1 : 0);
   return s >= 0.3 ? Math.min(0.8, s) : 0;
 }
 
@@ -338,9 +386,9 @@ function mailHeaders(t: string): { score: number; mime: string } {
   return { score, mime: ct };
 }
 
-function csvScore(t: string, sep: string): number {
+function csvScore(t: string, sep: string, minRows = 2): number {
   const lines = t.split(/\r?\n/).slice(0, 50).filter((l) => l.length);
-  if (lines.length < 2) return 0;
+  if (lines.length < minRows) return 0;
   const counts = lines.map((l) => {
     let n = 0, q = false;
     for (const ch of l) { if (ch === '"') q = !q; else if (ch === sep && !q) n++; }
@@ -354,6 +402,16 @@ function csvScore(t: string, sep: string): number {
 
 // ---------------------------------------------------------------------------------------
 // The rule table
+
+/** File-name extensions of plain text: weak content guesses (< 0.8) do not override them. */
+export const PLAIN_TEXT_EXTS = ['txt', 'text', 'log'];
+const TABLE_NO = /^(txt|text|log|)$/;
+const tableRows = (c: SniffContext) => (c.ext === 'csv' || c.ext === 'tsv' || c.ext === 'tab' ? 2 : 3);
+const MON = '(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)';
+// From_ line (asctime date, with or without a comma, zone or seconds), then a header line.
+const MBOX_FROM = new RegExp(`^From \\S+ +(Mon|Tue|Wed|Thu|Fri|Sat|Sun),? +(${MON} +\\d{1,2}|\\d{1,2} +${MON}) +(\\d{4} +)?\\d{1,2}:\\d\\d(:\\d\\d)?[^\\r\\n]*\\r?\\n[A-Za-z][A-Za-z0-9-]*:[ \\t]`);
+/** ID3v2 tag header: version 2-4, then four syncsafe size bytes. */
+const id3Header = (b: Uint8Array) => b.length >= 10 && b[3] >= 2 && b[3] <= 4 && b[4] < 0x10 && b[6] < 0x80 && b[7] < 0x80 && b[8] < 0x80 && b[9] < 0x80;
 
 const WORKS_NOT_WP = /DBDoc|SSDoc|database|spreadsheet|base de datos|datenbank|tabelle|hoja de c/i;
 const R = (format: string, label: string, category: SniffCategory, ext: string[], test?: SniffRule['test']): SniffRule => ({ format, label, category, ext, test });
@@ -436,12 +494,13 @@ const RULES: SniffRule[] = [
   }),
 
   // ---- Lotus
-  R('lwp', 'Lotus Word Pro document', DOC, ['lwp', 'mwp', 'smt'], (c) => (c.at(0, 'WordPro') ? 0.97 : 0)),
-  R('sam', 'Ami Pro document', DOC, ['sam'], (c) => (!c.binary() && /^\s*\[ver\]\s*\r?\n\s*\d/.test(c.head) ? 0.95 : 0)),
+  // ASCII magics: the binary file structure must follow ("WordPro is…" in a text file is text).
+  R('lwp', 'Lotus Word Pro document', DOC, ['lwp', 'mwp', 'smt'], (c) => (c.at(0, 'WordPro') && c.binary() ? 0.97 : 0)),
+  R('sam', 'Ami Pro document', DOC, ['sam'], (c) => (!c.binary() && /^\s*\[ver\][ \t]*\r?\n\s*\d/.test(c.head) ? 0.95 : 0)),
 
   // ---- Macintosh word processors
   R('cwk', 'ClarisWorks / AppleWorks document', DOC, ['cwk', 'cws'], (c) => (c.at(4, 'BOBO') ? { confidence: 0.95, label: `ClarisWorks / AppleWorks ${c.bytes[0] >= 5 ? c.bytes[0] : ''} document`.replace('  ', ' ') } : 0)),
-  R('wn', 'WriteNow document', DOC, ['wn', 'wn2', 'wn3', 'wn4'], (c) => (c.at(0, 'WriteNow') ? 0.95 : 0)),
+  R('wn', 'WriteNow document', DOC, ['wn', 'wn2', 'wn3', 'wn4'], (c) => (c.at(0, 'WriteNow') && c.binary() ? 0.95 : 0)),
   R('mcw', 'MacWrite document', DOC, ['mcw', 'mw', 'mwii', 'mwp'], (c) => {
     const v = c.u16be(0);
     if ((v === 3 || v === 6) && c.u16be(2) > 0 && c.u16be(2) < 2000 && c.bytes.length > 0x100) return { confidence: 0.45, label: v === 6 ? 'MacWrite 4.5-5.0 document' : 'MacWrite 2.2 document' };
@@ -512,13 +571,16 @@ const RULES: SniffRule[] = [
   }),
   R('mobi', 'Mobipocket / Kindle e-book', DOC, ['mobi', 'azw', 'azw3', 'prc'], (c) => (c.head.slice(60, 68) === 'BOOKMOBI' ? 0.97 : 0)),
   R('lrf', 'Sony BBeB e-book', DOC, ['lrf'], (c) => (c.at(0, 'L\0R\0F\0') ? 0.95 : 0)),
-  R('pdf', 'PDF document', DOC, ['pdf', 'ai'], (c) => (c.head.slice(0, 1024).includes('%PDF-') ? 0.99 : 0)),
+  // %PDF- at the start; within the first 1 KB only behind binary junk (a wrapper), never inside text.
+  R('pdf', 'PDF document', DOC, ['pdf', 'ai'], (c) => (/^(\xef\xbb\xbf)?\s*%PDF-/.test(c.head.slice(0, 1024)) || (c.head.slice(0, 1024).includes('%PDF-') && c.binary()) ? 0.99 : 0)),
   R('webarchive', 'Safari web archive', DOC, ['webarchive'], (c) => (c.at(0, 'bplist00') && c.bytes.length < 50e6 && /WebMainResource/.test(new TextDecoder('latin1').decode(c.bytes.subarray(0, 200000))) ? 0.9 : 0)),
   R('qpd', 'Anne\'s Pen document', DOC, ['qpd', 'json'], (c) => (/^\s*\{\s*"(type|qf)"/.test(c.head) ? 0.95 : 0)),
   R('html', 'Web page (HTML)', DOC, ['html', 'htm', 'xhtml', 'xht', 'shtml', 'php', 'asp'], (c) => {
     if (c.binary()) return 0;
     const t = c.text().slice(0, 4096).toLowerCase();
-    if (/^\s*(<\?xml[^>]*>\s*)?(<!--[\s\S]*?-->\s*)*<!doctype html/.test(t) || /^\s*(<\?xml[^>]*>\s*)?<html[\s>]/.test(t)) return 0.95;
+    // Leading comments are skipped by a linear scan (a nested regex here was exponential).
+    const i = skipProlog(t, false);
+    if (t.startsWith('<!doctype html', i) || /^<html[\s>]/.test(t.slice(i, i + 6))) return 0.95;
     const r = c.xmlRoot();
     if (r && r.name === 'html') return 0.9;
     return /<(head|body|meta|title|p|div|table)[\s>]/.test(t) && /<\/(p|div|body|html|table|title)>/.test(t) ? 0.5 : 0;
@@ -590,15 +652,21 @@ const RULES: SniffRule[] = [
   R('dbf', 'dBASE / FoxPro table', SHEET, ['dbf', 'dbase'], (c) => {
     const b = c.bytes;
     if (b.length < 66 || ![0x02, 0x03, 0x04, 0x05, 0x30, 0x31, 0x32, 0x43, 0x63, 0x83, 0x8b, 0xcb, 0xf5, 0xfb].includes(b[0])) return 0;
-    const mm = b[2], dd = b[3], hdr = c.u16le(8), rec = c.u16le(10);
+    const mm = b[2], dd = b[3], n = c.u32le(4), hdr = c.u16le(8), rec = c.u16le(10);
     if (mm < 1 || mm > 12 || dd < 1 || dd > 31 || hdr < 65 || hdr > b.length || rec < 1) return 0;
     if ((hdr - 33) % 32 !== 0 && (hdr - 33 - 263) % 32 !== 0 && b[hdr - 1] !== 0x0d) return 0;
+    // The records must fit the file (a truncated table may end early), and the first field
+    // descriptor needs a field type letter.
+    if (hdr + n * rec > b.length + 1 || b.length - (hdr + n * rec) > Math.max(4096, rec)) return 0;
+    if (!'CNLDMFBGPYTIV@O+0WQ'.includes(String.fromCharCode(b[43]))) return 0;
     return 0.8;
   }),
   R('sylk', 'SYLK spreadsheet', SHEET, ['slk', 'sylk'], (c) => (/^ID;(P|N)/.test(c.head) ? 0.9 : 0)),
   R('dif', 'Data Interchange Format', SHEET, ['dif'], (c) => (/^TABLE\r?\n0,1\r?\n/.test(c.head) ? 0.9 : 0)),
-  R('csv', 'Comma-separated values', SHEET, ['csv'], (c) => (c.binary() ? 0 : Math.max(csvScore(c.text().slice(0, 16384), ','), csvScore(c.text().slice(0, 16384), ';') * 0.95))),
-  R('tsv', 'Tab-separated values', SHEET, ['tsv', 'tab'], (c) => (c.binary() ? 0 : csvScore(c.text().slice(0, 16384), '\t') * 0.9)),
+  // Prose has commas and tabs too: outside .csv/.tsv a table needs three consistent rows, and
+  // never wins over a text file name or a name with no extension.
+  R('csv', 'Comma-separated values', SHEET, ['csv'], (c) => (c.binary() || TABLE_NO.test(c.ext) ? 0 : Math.max(csvScore(c.text().slice(0, 16384), ',', tableRows(c)), csvScore(c.text().slice(0, 16384), ';', tableRows(c)) * 0.95))),
+  R('tsv', 'Tab-separated values', SHEET, ['tsv', 'tab'], (c) => (c.binary() || TABLE_NO.test(c.ext) ? 0 : csvScore(c.text().slice(0, 16384), '\t', tableRows(c)) * 0.9)),
 
   // ---- Presentations
   R('pptx', 'PowerPoint presentation (Office Open XML)', PRES, ['pptx', 'pptm', 'ppsx', 'ppsm', 'potx', 'potm'], (c) => (zipHas(c, 'ppt/presentation.xml') ? 0.99 : 0)),
@@ -621,7 +689,8 @@ const RULES: SniffRule[] = [
   R('pst', 'Outlook data file', MAIL, ['pst', 'ost'], (c) => (c.at(0, '!BDN') ? 0.97 : 0)),
   R('dbx', 'Outlook Express folder', MAIL, ['dbx'], (c) => (c.u32le(0) === 0xfe12adcf ? 0.95 : 0)),
   R('emlx', 'Apple Mail message', MAIL, ['emlx', 'partial.emlx'], (c) => { const m = /^(\d{1,9})[ \t]*\r?\n/.exec(c.head); return m && mailHeaders(c.text().slice(m[0].length)).score >= 0.6 ? 0.9 : 0; }),
-  R('mbox', 'Mailbox (mbox)', MAIL, ['mbox', 'mbx', 'mbs', 'mail'], (c) => (c.binary() ? 0 : /^From \S+.*\r?\n[A-Za-z-]+: /.test(c.head) ? 0.85 : /^From \S+ +(Mon|Tue|Wed|Thu|Fri|Sat|Sun) .*\d\d:\d\d/.test(c.head) ? 0.75 : 0)),
+  // "From <address> <asctime date>" followed by a header block ("From here to eternity" is prose).
+  R('mbox', 'Mailbox (mbox)', MAIL, ['mbox', 'mbx', 'mbs', 'mail'], (c) => (c.binary() ? 0 : MBOX_FROM.test(c.head) ? 0.85 : 0)),
   R('mhtml', 'Web archive (MHTML)', MAIL, ['mht', 'mhtml'], (c) => {
     if (c.binary()) return 0;
     const h = mailHeaders(c.text());
@@ -660,7 +729,7 @@ const RULES: SniffRule[] = [
   R('publisher', 'Publisher document', UNK, ['pub'], (c) => (cfbHas(c, 'Quill') ? 0.95 : 0)),
   R('ooxml-encrypted', 'Password-protected Office document', UNK, ['docx', 'xlsx', 'pptx', 'docm', 'xlsm', 'pptm'], (c) => (cfbHas(c, 'EncryptedPackage') ? 0.97 : 0)),
   R('exe', 'Program file', UNK, ['exe', 'dll', 'com', 'msi', 'so', 'dylib'], (c) => (c.at(0, 'MZ') && c.u32le(0x3c) < c.bytes.length && c.at(c.u32le(0x3c), 'PE\0\0') ? 0.95 : c.at(0, '\x7fELF') ? 0.95 : 0)),
-  R('media', 'Audio or video file', UNK, ['mp3', 'mp4', 'm4a', 'wav', 'avi', 'mov', 'ogg', 'flac', 'mkv', 'webm'], (c) => (c.at(4, 'ftyp') || c.at(0, 'ID3') || c.at(0, 'OggS') || c.at(0, 'fLaC') || (c.at(0, 'RIFF') && (c.at(8, 'WAVE') || c.at(8, 'AVI '))) || c.at(0, '\x1aE\xdf\xa3') ? 0.95 : 0)),
+  R('media', 'Audio or video file', UNK, ['mp3', 'mp4', 'm4a', 'wav', 'avi', 'mov', 'ogg', 'flac', 'mkv', 'webm'], (c) => (c.at(4, 'ftyp') || (c.at(0, 'ID3') && id3Header(c.bytes)) || c.at(0, 'OggS') || c.at(0, 'fLaC') || (c.at(0, 'RIFF') && (c.at(8, 'WAVE') || c.at(8, 'AVI '))) || c.at(0, '\x1aE\xdf\xa3') ? 0.95 : 0)),
   R('sqlite', 'SQLite database', UNK, ['sqlite', 'db', 'sqlite3'], (c) => (c.at(0, 'SQLite format 3\0') ? 0.97 : 0)),
 ];
 
@@ -709,6 +778,9 @@ export function sniff(data: ArrayBuffer | Uint8Array, name = ''): SniffResult {
     if (!best || score > best.score) best = { rule, hit, score };
   }
   const empty = ctx.bytes.length === 0;
+  // A text file name wins over weak content guesses (heuristics, light markup, tables): only a
+  // real signature (≥ 0.8) reopens a readable .txt as something else.
+  if (best && PLAIN_TEXT_EXTS.includes(ext) && best.hit.confidence < 0.8 && best.rule.format !== 'txt' && !ctx.binary()) best = null;
   if (!best || best.hit.confidence < 0.3) {
     // Weak or no content match: trust the extension when a rule claims it, else plain text or unknown.
     const byExt = ext ? sniffRules().find((r) => r.ext[0] === ext && r.format !== 'txt') || sniffRules().find((r) => r.ext.includes(ext) && r.format !== 'txt') : undefined;
