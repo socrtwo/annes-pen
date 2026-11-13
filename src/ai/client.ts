@@ -121,24 +121,30 @@ async function sse(def: ProviderDef, r: HttpReq, onEvent: (data: string, event: 
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = '';
+  const block = (text: string) => {
+    let event = 'message';
+    const data: string[] = [];
+    for (const line of text.split(/\r?\n/)) {
+      if (line.startsWith('event:')) event = line.slice(6).trim();
+      else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+    }
+    if (data.length) onEvent(data.join('\n'), event);
+  };
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += dec.decode(value, { stream: true });
-      let idx: number;
-      while ((idx = buf.search(/\r?\n\r?\n/)) >= 0) {
-        const block = buf.slice(0, idx);
-        buf = buf.slice(idx + (buf[idx] === '\r' ? 4 : 2));
-        let event = 'message';
-        const data: string[] = [];
-        for (const line of block.split(/\r?\n/)) {
-          if (line.startsWith('event:')) event = line.slice(6).trim();
-          else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
-        }
-        if (data.length) onEvent(data.join('\n'), event);
+      let m: RegExpExecArray | null;
+      while ((m = /\r?\n\r?\n/.exec(buf))) {
+        const text = buf.slice(0, m.index);
+        buf = buf.slice(m.index + m[0].length);
+        block(text);
       }
     }
+    // A last event the server ended without a blank line.
+    buf += dec.decode();
+    if (buf.trim()) block(buf);
   } catch (e: any) {
     if (e?.name === 'AbortError') throw new AiError('Stopped', 'aborted');
     void reader.cancel().catch(() => undefined);

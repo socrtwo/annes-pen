@@ -7,7 +7,7 @@ import { normalizeSettings } from '../editor/settings';
 import { FORMATS, formatById, formatForName, importFile, exportFile, sniff } from '../io';
 import { openDocument, saveAs, writeBack, printDocument, shareFile, readUri, openExternal, OPEN_ACCEPT, OPEN_MIMES } from '../platform/native';
 import { openDialog, toast, confirmDialog, choiceDialog, alertDialog } from '../ui/dialog';
-import { kvGet, kvSet, kvKeys, kvDel } from '../util/store';
+import { kvGet, kvSet, kvDel, orphanedDrafts } from '../util/store';
 import { TEMPLATES } from '../templates';
 import { countWords, docText } from '../editor/ops';
 import { listChanges, resolveChanges } from '../editor/plugins/trackChanges';
@@ -17,7 +17,9 @@ import { h } from '../ui/dom';
 import { showRecoveryReport, showManualRecovery, recoverySummary } from '../ui/recovery';
 import { SPELL_DIALECTS } from '../proof/proofing';
 import { refuseIfProtected } from './review';
-import { sanitizePrefs } from '../prefs';
+import { sanitizePrefs, type Prefs } from '../prefs';
+import { trackPositions } from '../app';
+import { isNative } from '../platform/native';
 
 const N = schema.nodes;
 
@@ -63,6 +65,8 @@ async function openRecoveredText(app: App, text: string, name: string): Promise<
 
 export async function openBuffer(app: App, data: ArrayBuffer, name: string, uri: string | null, opts: { repair?: boolean; textOnly?: boolean; key?: string } = {}): Promise<DocTab | null> {
   try {
+    const { isEncryptedDoc } = await import('../util/crypto');
+    if (!opts.repair && !opts.textOnly && isEncryptedDoc(data)) return await openEncrypted(app, { name, data, uri });
     if (opts.repair || opts.textOnly) toast(opts.textOnly ? `Recovering text from ${name}…` : `Repairing ${name}…`);
     // Identify the file by its content; the extension only breaks ties.
     const sniffed = sniff(data, name);
@@ -101,7 +105,8 @@ export async function openBuffer(app: App, data: ArrayBuffer, name: string, uri:
     if (recovery) tab.dirty = true;
     else {
       addRecent(app, tab);
-      await kvSet('file:' + docKey(tab), { name, data, uri, when: Date.now() });
+      // The cached copy (Recent, Revert) must not hold up opening; a failure to store it is ignored.
+      void kvSet('file:' + docKey(tab), { name, data, uri, when: Date.now() });
     }
     app.activate(tab);
     if (recovery) {
@@ -127,10 +132,55 @@ function addRecent(app: App, tab: DocTab) {
 }
 
 async function snapshot(app: App, tab: DocTab, label: string, doc = tab.view.state.doc) {
+  if (tab.encryption) return; // snapshots are stored unencrypted
   await kvSet(`snap:${docKey(tab)}:${Date.now()}`, { label, json: doc.toJSON(), words: countWords(docText(doc)), when: Date.now(), name: tab.displayName });
 }
 
+/** Encrypted name for a document: .qpde (also for files with the former name's .qfde). */
+const encryptedName = (name: string) => `${(name || 'Document').replace(/\.(qpde|qfde|qpd|qfd)$/i, '').replace(/\.[^.]+$/, '')}.qpde`;
+
+/** Opens an encrypted document: asks for its password and keeps the key on the tab so Save encrypts again. */
+export async function openEncrypted(app: App, f: { name: string; data: ArrayBuffer; uri: string | null }): Promise<DocTab | null> {
+  const r = await openDialog({ title: 'Password', fields: [{ key: 'p', label: `Password for ${f.name}`, type: 'password', autofocus: true }] });
+  if (!r) return null;
+  let opened: { json: any; key: import('../util/crypto').DocKey };
+  try {
+    const { decryptJsonWithKey } = await import('../util/crypto');
+    opened = await decryptJsonWithKey(f.data, r.p);
+  } catch { toast('Wrong password or damaged file.'); return null; }
+  const fileName = encryptedName(f.name);
+  // A .qfde keeps its URI only for reading: saving writes a .qpde.
+  const tab = app.createTab(schema.nodeFromJSON(opened.json), { title: fileName.replace(/\.qpde$/, ''), fileName, format: 'qpd', uri: /\.qpde$/i.test(f.name) ? f.uri : null, encryption: opened.key });
+  addRecent(app, tab);
+  void kvSet('file:' + docKey(tab), { name: f.name, data: f.data, uri: f.uri, when: Date.now() }); // encrypted bytes
+  app.activate(tab);
+  toast(`Opened ${f.name} (encrypted)`);
+  return tab;
+}
+
+/** Save for an encrypted document: encrypted again with its key, as .qpde. */
+async function saveEncrypted(app: App, tab: DocTab, as: boolean): Promise<boolean> {
+  const { encryptWithKey } = await import('../util/crypto');
+  const doc = tab.view.state.doc;
+  const blob = new Blob([(await encryptWithKey(doc.toJSON(), tab.encryption!)) as BlobPart], { type: 'application/octet-stream' });
+  const name = encryptedName(tab.fileName || tab.title);
+  if (!as && tab.uri && /\.qpde$/i.test(tab.fileName)) {
+    try {
+      if (await writeBack(tab.uri, blob)) { markSaved(app, tab, doc); toast(`Saved ${tab.displayName} (encrypted)`); return true; }
+    } catch (e) { console.warn(e); }
+  }
+  const r = await saveAs(blob, name);
+  if (!r) return false;
+  tab.fileName = r.name; tab.title = r.name.replace(/\.[^.]+$/, ''); tab.format = 'qpd'; tab.uri = r.uri;
+  markSaved(app, tab, doc);
+  addRecent(app, tab);
+  void kvSet('file:' + docKey(tab), { name: r.name, data: await blob.arrayBuffer(), uri: r.uri, when: Date.now() });
+  toast(`Saved ${r.name} (encrypted)`);
+  return true;
+}
+
 export async function saveTab(app: App, tab: DocTab, opts: { as?: boolean; format?: string; copy?: boolean } = {}): Promise<boolean> {
+  if (tab.encryption && !opts.copy && (!opts.format || opts.format === 'qpde' || (opts.format === 'qpd' && !opts.as))) return saveEncrypted(app, tab, !!opts.as);
   let format = opts.format || (formatById(tab.format)?.canExport && tab.format !== 'pdf' ? tab.format : app.prefs.defaultSaveFormat);
   const fmt = formatById(format);
   if (!fmt?.export) { toast('Choose another format.'); return false; }
@@ -154,6 +204,7 @@ export async function saveTab(app: App, tab: DocTab, opts: { as?: boolean; forma
   const r = await saveAs(blob, name);
   if (!r) return false;
   if (!opts.copy) {
+    tab.encryption = null; // saved as an ordinary file by choice (Save As another format)
     tab.fileName = r.name; tab.title = r.name.replace(/\.[^.]+$/, ''); tab.format = formatForName(r.name)?.id || format; tab.uri = r.uri;
     markSaved(app, tab, doc);
     addRecent(app, tab);
@@ -182,9 +233,15 @@ function hasRichContent(doc: PMNode): boolean {
   return rich;
 }
 
+/** Browsers keep Ctrl+N, Ctrl+W, Ctrl+T and their Shift forms for themselves: the web build lists an
+ *  alternative first (shown in tooltips and menus) and keeps the usual keys for installed windows. */
+export function webKeys(keys: string[], alt: string): string[] {
+  return isNative() ? keys : [alt, ...keys];
+}
+
 def([
   {
-    id: 'file.new', label: 'New Document', icon: 'note_add', tab: 'Backstage', group: 'New', keys: ['Mod-n'], popular: true, noRecord: true,
+    id: 'file.new', label: 'New Document', icon: 'note_add', tab: 'Backstage', group: 'New', keys: webKeys(['Mod-n'], 'Alt-n'), popular: true, noRecord: true,
     run: (app, arg) => {
       const t = TEMPLATES.find((x) => x.id === arg);
       const prev = app.tab && isPristine(app.tab) ? app.tab : null;
@@ -328,7 +385,7 @@ def([
   },
   { id: 'file.email', label: 'Email as Attachment', icon: 'attach_email', tab: 'Backstage', group: 'Share', noRecord: true, run: (app) => app.exec('file.share') },
   {
-    id: 'file.close', label: 'Close Document', icon: 'close', tab: 'Backstage', group: 'Close', keys: ['Mod-w', 'Mod-F4'], popular: true, noRecord: true,
+    id: 'file.close', label: 'Close Document', icon: 'close', tab: 'Backstage', group: 'Close', keys: webKeys(['Mod-w', 'Mod-F4'], 'Alt-w'), popular: true, noRecord: true,
     run: async (app, arg) => {
       const tab = app.docs.find((d) => d.id === arg) || app.tab;
       if (tab.dirty && app.prefs.confirmClose) {
@@ -347,6 +404,7 @@ def([
       const tab = app.tab;
       const cached = await kvGet('file:' + docKey(tab));
       if (!cached) { toast('No saved version to revert to.'); return; }
+      if (tab.encryption) { toast('Close an encrypted document and open it again to revert it.'); return; }
       if (!(await confirmDialog('Revert', 'Discard all changes since the last save?'))) return;
       const { doc } = await importFile(cached.data, cached.name);
       app.replaceDoc(tab, doc); tab.dirty = false; app.ui.tabsChanged();
@@ -400,9 +458,11 @@ def([
         { key: 'merge', label: 'Mail merge data', type: 'checkbox', value: !!s.mergeData },
       ], ok: 'Remove' });
       if (!r) return;
-      let tr = st.tr.setMeta('trackSkip', true);
-      if (r.changes) { tr = resolveChanges(st, listChanges(st.doc), true); }
-      const ns = JSON.parse(JSON.stringify(s));
+      // Built from the document as it is now: it may have changed while the dialog was open.
+      const now = app.state;
+      let tr = now.tr.setMeta('trackSkip', true);
+      if (r.changes) { tr = resolveChanges(now, listChanges(now.doc), true); }
+      const ns = JSON.parse(JSON.stringify(app.settings));
       if (r.comments) { ns.comments = {}; tr.doc.descendants((n, pos) => { if (n.isInline) for (const m of n.marks) if (m.type === schema.marks.comment) tr.removeMark(pos, pos + n.nodeSize, m); return true; }); }
       if (r.props) { for (const k of Object.keys(ns.properties)) ns.properties[k] = k === 'title' ? ns.properties.title : ''; ns.customProps = {}; }
       if (r.hf) { for (const k of ['header', 'footer', 'firstHeader', 'firstFooter', 'evenHeader', 'evenFooter']) ns[k] = { left: '', center: '', right: '' }; ns.watermark = null; }
@@ -428,10 +488,14 @@ def([
     run: async (app) => {
       const r = await openDialog({ title: 'Encrypt Document', help: 'Saves an AES-256-GCM encrypted Anne\'s Pen file (.qpde). If you lose the password, the file cannot be recovered.', fields: [{ key: 'p1', label: 'Password', type: 'password' }, { key: 'p2', label: 'Confirm', type: 'password' }], validate: (x) => (!x.p1 ? 'Enter a password.' : x.p1 !== x.p2 ? 'Passwords do not match.' : null) });
       if (!r) return;
-      const { encryptJson } = await import('../util/crypto');
-      const data = await encryptJson(app.state.doc.toJSON(), r.p1);
-      const name = `${app.tab.title}.qpde`;
-      await saveAs(new Blob([data as BlobPart], { type: 'application/octet-stream' }), name);
+      const { newDocKey } = await import('../util/crypto');
+      const tab = app.tab;
+      const prev = { encryption: tab.encryption, fileName: tab.fileName };
+      tab.encryption = await newDocKey(r.p1);
+      tab.fileName = encryptedName(tab.fileName || tab.title);
+      // From now on the document stays encrypted: Save writes the .qpde again and drafts are encrypted.
+      if (!(await saveEncrypted(app, tab, true))) Object.assign(tab, prev);
+      else app.ui.tabsChanged();
     },
   },
   {
@@ -439,28 +503,32 @@ def([
     run: async (app) => {
       const f = await openDocument('.qpde,.qfde', ['application/octet-stream', '*/*']);
       if (!f) return;
-      const r = await openDialog({ title: 'Password', fields: [{ key: 'p', label: `Password for ${f.name}`, type: 'password', autofocus: true }] });
-      if (!r) return;
-      try {
-        const { decryptJson } = await import('../util/crypto');
-        const json = await decryptJson(f.data, r.p);
-        app.createTab(schema.nodeFromJSON(json), { title: f.name.replace(/\.(qpde|qfde)$/, ''), fileName: f.name.replace(/\.qpde$/, '.qpd'), format: 'qpd' });
-      } catch { toast('Wrong password or damaged file.'); }
+      await openEncrypted(app, f);
     },
   },
   { id: 'file.versions', label: 'Version History', icon: 'history', tab: 'Backstage', group: 'Info', popular: true, noRecord: true, origin: 'Snapshots (Scrivener) / version history (online editors)', run: (app) => { app.ui.hideBackstage(); app.ui.openPane('versions'); } },
-  { id: 'file.snapshot', label: 'Take Snapshot', icon: 'add_a_photo', tab: 'Backstage', group: 'Info', keys: ['Mod-Alt-5'], noRecord: true, run: async (app) => { const r = await openDialog({ title: 'Take Snapshot', fields: [{ key: 'label', label: 'Snapshot name', type: 'text', value: `Snapshot ${new Date().toLocaleString()}` }] }); if (r) { await snapshot(app, app.tab, r.label); toast('Snapshot saved'); } } },
+  { id: 'file.snapshot', label: 'Take Snapshot', icon: 'add_a_photo', tab: 'Backstage', group: 'Info', keys: ['Mod-Alt-5'], noRecord: true, run: async (app) => { if (app.tab.encryption) { toast('Snapshots are not kept for encrypted documents.'); return; } const r = await openDialog({ title: 'Take Snapshot', fields: [{ key: 'label', label: 'Snapshot name', type: 'text', value: `Snapshot ${new Date().toLocaleString()}` }] }); if (r) { await snapshot(app, app.tab, r.label); toast('Snapshot saved'); } } },
   {
     id: 'file.recover', label: 'Recover Unsaved Documents', icon: 'restore_page', tab: 'Backstage', group: 'Info', noRecord: true,
     run: async (app) => {
-      const keys = (await kvKeys('draft:')).filter((k) => !app.docs.some((d) => 'draft:' + d.id === k));
+      // Only drafts whose window has closed: another open window's drafts are still in use.
+      const keys = await orphanedDrafts((k) => app.docs.some((d) => 'draft:' + d.id === k));
       if (!keys.length) { toast('No unsaved drafts found.'); return; }
       const drafts = await Promise.all(keys.map(async (k) => ({ k, d: await kvGet(k) })));
       const r = await openDialog({ title: 'Document Recovery', fields: [{ key: 'k', label: 'Available drafts', type: 'list', multiple: true, rows: 8, options: drafts.map(({ k, d }) => ({ value: k, label: `${d.fileName || d.title} — ${new Date(d.time).toLocaleString()}` })), value: keys }], buttons: [{ label: 'Discard All', onClick: async (_v, ctl) => { for (const k of keys) await kvDel(k); ctl.close(); toast('Drafts discarded'); } }], ok: 'Recover' });
       if (!r?.k?.length) return;
       for (const { k, d } of drafts.filter((x) => r.k.includes(x.k))) {
-        app.createTab(schema.nodeFromJSON(d.json), { title: d.title, fileName: d.fileName, format: d.format, uri: d.uri, key: d.key || '', dirty: true } as any);
-        await kvDel(k);
+        let json = d.json, encryption = null;
+        if (d.enc) {
+          const p = await openDialog({ title: 'Password', fields: [{ key: 'p', label: `Password for ${d.fileName || d.title}`, type: 'password', autofocus: true }] });
+          if (!p) continue;
+          try { ({ json, key: encryption } = await (await import('../util/crypto')).decryptJsonWithKey(d.enc, p.p)); } catch { toast('Wrong password or damaged draft.'); continue; }
+        }
+        const tab = app.createTab(schema.nodeFromJSON(json), { title: d.title, fileName: d.fileName, format: d.format, uri: d.uri, key: d.key || '', encryption } as any);
+        tab.dirty = true;
+        app.ui.tabsChanged();
+        // The old draft goes only once the recovered document has a draft of its own.
+        if ((await kvSet('draft:' + tab.id, { ...d, ...(encryption ? { enc: d.enc } : { json }), id: tab.id, owner: (await import('../util/store')).SESSION_ID, time: Date.now() })) !== false) await kvDel(k);
       }
     },
   },
@@ -560,6 +628,7 @@ def([
       // Only well-formed values are taken, and nothing is stored until the interface has rebuilt with them.
       const before = JSON.parse(JSON.stringify(app.prefs));
       const s = sanitizePrefs(p);
+      if (!(await confirmImportedScripts(app, s))) return;
       Object.assign(app.prefs, s, { autoformat: { ...app.prefs.autoformat, ...(s.autoformat || {}) }, recent: app.prefs.recent });
       try { app.ui.applyPrefs(); app.ui.rebuild(); } catch (e: any) {
         Object.assign(app.prefs, before); app.ui.applyPrefs(); app.ui.rebuild();
@@ -572,6 +641,30 @@ def([
   },
   { id: 'file.resetCustomizations', label: 'Reset All Customizations', icon: 'restart_alt', tab: 'Backstage', group: 'Options', noRecord: true, run: async (app) => { if (!(await confirmDialog('Reset', 'Reset the Quick Access Bar, custom tabs and keyboard shortcuts to defaults?'))) return; const { DEFAULT_QAT } = await import('../prefs'); app.prefs.qat = [...DEFAULT_QAT]; app.prefs.customTabs = []; app.prefs.hiddenTabs = []; app.prefs.keymap = {}; app.savePrefs(); app.ui.rebuild(); } },
 ]);
+
+/**
+ * Script macros run JavaScript, so settings or macro files that bring them in ask first. Declined
+ * scripts are dropped with the shortcuts, Quick Access buttons and tab items that run them; accepted
+ * ones are marked untrusted and ask once more before they first run. Scripts identical to ones already
+ * here stay as they are. Returns false if the import was cancelled.
+ */
+export async function confirmImportedScripts(app: App, s: Partial<Prefs>): Promise<boolean> {
+  const isScript = (m: { steps: { id: string }[] }) => m.steps.some((st) => st.id === '__script');
+  const same = (m: Prefs['macros'][number]) => app.prefs.macros.some((x) => x.name === m.name && !x.untrusted && JSON.stringify(x.steps) === JSON.stringify(m.steps));
+  const scripts = (s.macros || []).filter((m) => isScript(m) && !same(m));
+  if (!scripts.length) return true;
+  const names = scripts.map((m) => `“${m.name}”`).join(', ');
+  const c = await choiceDialog('Import Script Macros?', `This import contains ${scripts.length} script macro(s) that can run code: ${names}. Only import scripts from someone you trust. Import the scripts?`, ['Import scripts', 'Leave scripts out']);
+  if (c < 0) return false;
+  if (c === 0) { for (const m of scripts) m.untrusted = true; return true; }
+  const dropped = new Set(scripts.map((m) => `macro:${m.name}`));
+  s.macros = s.macros!.filter((m) => !scripts.includes(m));
+  if (s.keymap) s.keymap = Object.fromEntries(Object.entries(s.keymap).filter(([, id]) => !dropped.has(id)));
+  if (s.qat) s.qat = s.qat.filter((id) => !dropped.has(id));
+  if (s.pinnedCommands) s.pinnedCommands = s.pinnedCommands.filter((id) => !dropped.has(id));
+  if (s.customTabs) s.customTabs = s.customTabs.map((t) => ({ ...t, groups: t.groups.map((g) => ({ ...g, items: g.items.filter((id) => !dropped.has(id)) })) }));
+  return true;
+}
 
 // Help -------------------------------------------------------------------------------------------
 def([
@@ -592,9 +685,9 @@ def([
     run: async () => {
       let text = '';
       try { const r = await fetch('./third-party-notices.txt'); if (r.ok) text = await r.text(); } catch { /* offline web build without the file */ }
-      await alertDialog('Third-Party Notices', h('pre', { class: 'qf-notices' }, text || 'The notices file is missing from this build. The licenses are listed at https://github.com/socrtwo/QuillPen/blob/main/docs/LEGAL.md.'));
+      await alertDialog('Third-Party Notices', h('pre', { class: 'qf-notices' }, text || 'The notices file is missing from this build. The licenses are listed at https://github.com/socrtwo/annes-pen/blob/main/docs/LEGAL.md.'));
     },
   },
-  { id: 'help.feedback', label: 'Report an Issue', icon: 'bug_report', tab: 'Help', group: 'Help', noRecord: true, run: () => openExternal('https://github.com/socrtwo/QuillPen/issues') },
-  { id: 'help.whatsNew', label: 'What’s New', icon: 'new_releases', tab: 'Help', group: 'Help', noRecord: true, run: () => alertDialog('What’s New in 0.3', 'Anne\'s Pen now runs on Windows, macOS, Linux, Raspberry Pi OS, ChromeOS, iOS and the web as well as Android (see the Releases page). Review ▸ Spelling Dictionaries downloads free dictionaries for 90+ languages, verified and kept offline, checked with Hunspell. Desktop apps save straight back to your files and keep API keys in the system keychain; the web app works offline and can be installed.\nVersion 0.2.1: spelling accepts every variety of English, AI keeps the author’s variety, recovery fixes, and Help ▸ Third-Party Notices.\nVersion 0.2 added recovery of damaged documents (Word Recovery engine), the AI tab with 67 commands, a free on-device model and a setup wizard for AI providers, and Word 97–2003 .doc files. Version 0.1 introduced the full command library, customizable Quick Access Bar and tabs, Print Layout, DOCX/ODT/RTF/HTML/Markdown/EPUB/TXT, track changes, comments, references, mail merge and macros.') },
+  { id: 'help.feedback', label: 'Report an Issue', icon: 'bug_report', tab: 'Help', group: 'Help', noRecord: true, run: () => openExternal('https://github.com/socrtwo/annes-pen/issues') },
+  { id: 'help.whatsNew', label: 'What’s New', icon: 'new_releases', tab: 'Help', group: 'Help', noRecord: true, run: () => alertDialog(`What’s New in ${__APP_VERSION__.split('.').slice(0, 2).join('.')}`, 'QuillPen is now Anne\'s Pen. Settings, drafts, AI keys, recent files and .qpd/.qpde documents carry over, and files from the earlier QuillForge name (.qfd/.qfde) still open. The sister apps are now Anne\'s Grid, Anne\'s Post and Anne\'s Stage.\nVersion 0.4 opened documents from every major word processor, current and historical, identified by their content: Word 1–95 and Word for DOS and Mac, WordPerfect, Works, Write, Ami Pro, MacWrite, WordStar, XyWrite, HWP and HWPX, Word 2003 XML, OpenOffice 1.x, AbiWord, KWord, Pages, FictionBook, DocBook, LaTeX and more. Spreadsheets, presentations and email can be imported or handed to the sister apps.\nVersion 0.3: Anne\'s Pen runs on Windows, macOS, Linux, Raspberry Pi OS, ChromeOS, iOS and the web as well as Android (see the Releases page). Review ▸ Spelling Dictionaries downloads free dictionaries for 90+ languages, verified and kept offline, checked with Hunspell. Desktop apps save straight back to your files and keep API keys in the system keychain; the web app works offline and can be installed.\nVersion 0.2.1: spelling accepts every variety of English, AI keeps the author’s variety, recovery fixes, and Help ▸ Third-Party Notices.\nVersion 0.2 added recovery of damaged documents (Word Recovery engine), the AI tab with 67 commands, a free on-device model and a setup wizard for AI providers, and Word 97–2003 .doc files. Version 0.1 introduced the full command library, customizable Quick Access Bar and tabs, Print Layout, DOCX/ODT/RTF/HTML/Markdown/EPUB/TXT, track changes, comments, references, mail merge and macros.') }, // rename:keep — names the former names on purpose
 ]);

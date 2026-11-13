@@ -1,6 +1,6 @@
 /** Developer tab: macros (recorded and scripted), content controls, form protection. */
 import { def, getCommand, allCommands } from './registry';
-import type { App } from '../app';
+import { trackPositions, type App } from '../app';
 import { NodeSelection, TextSelection } from 'prosemirror-state';
 import type { Node as PMNode } from 'prosemirror-model';
 import { schema } from '../editor/schema';
@@ -8,7 +8,7 @@ import { insertInline, selectedText, docText } from '../editor/ops';
 import { openDialog, toast, promptDialog, confirmDialog, showMenu } from '../ui/dialog';
 import { pickFile, readFileAsDataURL } from '../ui/dom';
 import { replaceAll } from './edit';
-import { sha } from './review';
+import { verifyPassword } from '../util/crypto';
 import type { Macro } from '../prefs';
 
 const N = schema.nodes;
@@ -43,7 +43,24 @@ export function validMacros(data: unknown): Macro[] {
     .map((m) => ({ ...m, description: typeof m.description === 'string' ? m.description : undefined, created: typeof m.created === 'number' ? m.created : Date.now() }));
 }
 
+/** CSV cell text that a spreadsheet will not run as a formula (= + - @, and tab or CR first). */
+export function csvSafe(s: string): string {
+  return /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+}
+
+/** An imported script macro asks once before it first runs; after that it is trusted. */
+async function trustScript(app: App, m: Macro): Promise<boolean> {
+  if (!m.untrusted || !m.steps.some((s) => s.id === '__script')) return true;
+  const ok = await confirmDialog('Run Imported Script?', `The macro “${m.name}” was imported and runs JavaScript code that can change your documents and settings. Run it only if you trust where it came from. Run it now?`, 'Run', 'Cancel');
+  if (!ok) return false;
+  for (const x of app.prefs.macros) if (x.name === m.name && x.untrusted) delete x.untrusted;
+  delete m.untrusted;
+  app.savePrefs();
+  return true;
+}
+
 export async function runMacro(app: App, m: Macro, times = 1) {
+  if (!(await trustScript(app, m))) return;
   for (let t = 0; t < times; t++) {
     for (const step of m.steps) {
       if (step.id === '__script') {
@@ -145,7 +162,7 @@ def([
   { id: 'dev.runMacro', label: 'Run Macro', icon: 'play_circle', tab: 'Developer', group: 'Code', internal: true, noRecord: true, run: (app, name: string) => { const m = app.prefs.macros.find((x) => x.name === name); if (m) return runMacro(app, m); toast(`Macro ${name} not found.`); } },
   {
     id: 'dev.exportMacros', label: 'Export Macros', icon: 'file_export', tab: 'Developer', group: 'Code', noRecord: true,
-    run: async (app) => { const { saveAs } = await import('../platform/native'); await saveAs(new Blob([JSON.stringify(app.prefs.macros, null, 1)], { type: 'application/json' }), 'QuillPen-macros.json'); },
+    run: async (app) => { const { saveAs } = await import('../platform/native'); await saveAs(new Blob([JSON.stringify(app.prefs.macros, null, 1)], { type: 'application/json' }), 'Annes-Pen-macros.json'); },
   },
   {
     id: 'dev.importMacros', label: 'Import Macros', icon: 'file_open', tab: 'Developer', group: 'Code', noRecord: true,
@@ -154,6 +171,11 @@ def([
       let list: Macro[];
       try { list = validMacros(JSON.parse(await f[0].text())); } catch { toast('Not a macro file.'); return; }
       if (!list.length) { toast('No valid macros in this file.'); return; }
+      const { confirmImportedScripts } = await import('./file');
+      const s = { macros: list };
+      if (!(await confirmImportedScripts(app, s))) return;
+      list = s.macros;
+      if (!list.length) { toast('No macros imported.'); return; }
       app.prefs.macros = [...app.prefs.macros.filter((m) => !list.some((x) => x.name === m.name)), ...list]; app.savePrefs(); app.ui.rebuild(); toast(`${list.length} macro(s) imported`);
     },
   },
@@ -176,13 +198,18 @@ def([
       const node = pos >= 0 ? app.state.doc.nodeAt(pos) : app.state.doc.nodeAt(sel.from);
       const p = pos >= 0 ? pos : sel.from;
       if (!node || node.type !== N.control) { toast('Select a content control.'); return; }
+      const pt = trackPositions(app);
+      // The control where it is now (the document may change while the dialog is open), or null if it is gone.
+      const here = () => { const q = pt.map(p, 1); const n = !pt.lost && !pt.deleted(p, 1) ? app.state.doc.nodeAt(q) : null; return n && n.type === N.control ? { q, n } : null; };
       const r = await openDialog({ title: 'Content Control Properties', fields: [
         { key: 'label', label: 'Title / placeholder', type: 'text', value: node.attrs.label },
         { key: 'tag', label: 'Tag', type: 'text', value: node.attrs.tag },
         { key: 'options', label: 'List items (one per line)', type: 'textarea', rows: 5, value: String(node.attrs.options).split('|').join('\n'), visibleIf: () => node.attrs.kind === 'dropdown' || node.attrs.kind === 'combo' },
         { key: 'locked', label: 'Content cannot be edited', type: 'checkbox', value: node.attrs.locked },
-      ], buttons: [{ label: 'Remove Control (keep value)', onClick: (_x, ctl) => { v(app).dispatch(app.state.tr.replaceWith(p, p + 1, node.attrs.value && node.attrs.kind !== 'checkbox' ? schema.text(node.attrs.value) : schema.text(node.attrs.kind === 'checkbox' ? (node.attrs.value === 'true' ? '☒' : '☐') : ' '))); ctl.close(); } }] });
-      if (r) v(app).dispatch(app.state.tr.setNodeMarkup(p, undefined, { ...node.attrs, label: r.label, tag: r.tag, options: String(r.options || '').split('\n').map((s: string) => s.trim()).filter(Boolean).join('|'), locked: r.locked }).setMeta('form', true));
+      ], buttons: [{ label: 'Remove Control (keep value)', onClick: (_x, ctl) => { const c = here(); if (c) { const a = c.n.attrs; v(app).dispatch(app.state.tr.replaceWith(c.q, c.q + 1, a.value && a.kind !== 'checkbox' ? schema.text(a.value) : schema.text(a.kind === 'checkbox' ? (a.value === 'true' ? '☒' : '☐') : ' '))); } ctl.close(); } }] });
+      const c = here();
+      pt.done();
+      if (r && c) v(app).dispatch(app.state.tr.setNodeMarkup(c.q, undefined, { ...c.n.attrs, label: r.label, tag: r.tag, options: String(r.options || '').split('\n').map((s: string) => s.trim()).filter(Boolean).join('|'), locked: r.locked }).setMeta('form', true));
     },
   },
   {
@@ -197,7 +224,7 @@ def([
       const on = p.mode !== 'forms';
       if (p.hash && p.mode !== 'none') {
         const pw = await promptDialog('Unprotect Document', 'Password:', '', { type: 'password' });
-        if (pw == null || (await sha(pw)) !== p.hash) { toast('Incorrect password.'); return; }
+        if (pw == null || !(await verifyPassword(pw, p.hash))) { toast('Incorrect password.'); return; }
       }
       app.view.dispatch(app.state.tr.setDocAttribute('settings', { ...JSON.parse(JSON.stringify(app.settings)), protection: { mode: on ? 'forms' : 'none', hash: on ? p.hash : undefined } }).setMeta('allowProtected', true).setMeta('trackSkip', true));
       app.view.setProps({});
@@ -209,7 +236,7 @@ def([
     run: async (app) => {
       const rows: string[][] = [['Tag', 'Title', 'Type', 'Value']];
       app.state.doc.descendants((n) => { if (n.type === N.control) rows.push([n.attrs.tag, n.attrs.label, n.attrs.kind, n.attrs.kind === 'picture' ? '(image)' : n.attrs.value]); return true; });
-      const csv = rows.map((r) => r.map((c) => `"${String(c ?? '').replace(/"/g, '""')}"`).join(',')).join('\n');
+      const csv = rows.map((r) => r.map((c) => `"${csvSafe(String(c ?? '')).replace(/"/g, '""')}"`).join(',')).join('\n');
       const { saveAs } = await import('../platform/native');
       await saveAs(new Blob([csv], { type: 'text/csv' }), `${app.tab.title}-form-data.csv`);
     },
@@ -224,7 +251,14 @@ export async function controlClick(app: App, pos: number, node: PMNode, el: HTML
   const view = app.view;
   if (node.attrs.locked && !app.tab.el.classList.contains('qf-design-mode')) return;
   if (app.tab.el.classList.contains('qf-design-mode')) { app.exec('dev.controlProperties', { pos }); return; }
-  const set = (value: string) => view.dispatch(view.state.tr.setNodeMarkup(pos, undefined, { ...node.attrs, value }).setMeta('form', true));
+  // Pickers and prompts wait for the user: the value goes to this control where it is by then
+  // (unchanged nodes stay the same objects when other parts of the document are edited).
+  const set = (value: string) => {
+    const d = view.state.doc;
+    let q = pos < d.content.size && d.nodeAt(pos) === node ? pos : -1;
+    if (q < 0) d.descendants((n, p) => { if (q < 0 && n === node) q = p; return q < 0; });
+    if (q >= 0) view.dispatch(view.state.tr.setNodeMarkup(q, undefined, { ...node.attrs, value }).setMeta('form', true));
+  };
   switch (node.attrs.kind) {
     case 'checkbox': set(node.attrs.value === 'true' ? 'false' : 'true'); return;
     case 'dropdown': case 'combo': {

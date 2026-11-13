@@ -1,6 +1,6 @@
 /** Insert tab: pages, tables, illustrations, links, header/footer, text, symbols. */
 import { def } from './registry';
-import type { App } from '../app';
+import { pinNode, findPinned, type App, type PinnedNode } from '../app';
 import { TextSelection, NodeSelection, type EditorState } from 'prosemirror-state';
 import { Fragment, Slice, type Mark, type Node as PMNode } from 'prosemirror-model';
 import { schema } from '../editor/schema';
@@ -181,11 +181,13 @@ export async function insertImageSrc(app: App, src: string, extra: Record<string
   insertInline(v(app), N.image.create({ src, width: Math.round(wpt), height: Math.round(hpt), ...extra }));
 }
 
-async function insertGenerated(app: App, svg: string, w: number, h: number, editKind: string, data: any, pos?: number) {
+async function insertGenerated(app: App, svg: string, w: number, h: number, editKind: string, data: any, pin?: PinnedNode) {
   const png = await rasterize(svgToDataUrl(svg), w, h, 2);
   const attrs = { src: png, width: Math.round(w * 0.75), height: Math.round(h * 0.75), editKind, editData: JSON.stringify(data), alt: data.alt || data.title || editKind };
   const view = v(app);
-  if (pos != null) {
+  // The picture being edited, where it is after the dialog and the drawing.
+  const pos = pin ? findPinned(view.state.doc, pin) : -1;
+  if (pos >= 0) {
     const node = view.state.doc.nodeAt(pos);
     if (node && node.type === N.image) { view.dispatch(view.state.tr.setNodeMarkup(pos, undefined, { ...node.attrs, ...attrs })); return; }
   }
@@ -279,6 +281,7 @@ export function editGraphicAt(app: App, pos?: number) {
 }
 
 async function editShape(app: App, d: ShapeData, pos?: number) {
+  const pin = pos != null ? pinNode(app.state.doc, pos) : undefined;
   const r = await openDialog({
     title: pos != null ? 'Edit Shape' : 'Insert Shape', wide: true, preview: true,
     fields: [
@@ -296,10 +299,11 @@ async function editShape(app: App, d: ShapeData, pos?: number) {
   });
   if (!r) return;
   const data = { ...d, ...r };
-  await insertGenerated(app, shapeSvg(data), data.w, data.h, 'shape', data, pos);
+  await insertGenerated(app, shapeSvg(data), data.w, data.h, 'shape', data, pin);
 }
 
 async function editDiagram(app: App, d: DiagramData, pos?: number) {
+  const pin = pos != null ? pinNode(app.state.doc, pos) : undefined;
   const r = await openDialog({
     title: pos != null ? 'Edit Diagram' : 'Insert Diagram', wide: true, preview: true,
     fields: [
@@ -316,7 +320,7 @@ async function editDiagram(app: App, d: DiagramData, pos?: number) {
   });
   if (!r) return;
   const data = toDiagram(r, d);
-  await insertGenerated(app, diagramSvg(data), data.w, data.h, 'diagram', data, pos);
+  await insertGenerated(app, diagramSvg(data), data.w, data.h, 'diagram', data, pin);
 }
 function toDiagram(x: any, d: DiagramData): DiagramData {
   const colors = x.mono ? Array(10).fill(x.c1) : [x.c1, x.c2, ...PALETTE.slice(2)];
@@ -324,6 +328,7 @@ function toDiagram(x: any, d: DiagramData): DiagramData {
 }
 
 async function editChart(app: App, d: ChartData, pos?: number) {
+  const pin = pos != null ? pinNode(app.state.doc, pos) : undefined;
   const r = await openDialog({
     title: pos != null ? 'Edit Chart' : 'Insert Chart', wide: true, preview: true,
     fields: [
@@ -339,7 +344,7 @@ async function editChart(app: App, d: ChartData, pos?: number) {
   });
   if (!r) return;
   const data: ChartData = { ...d, kind: r.kind, title: r.title, legend: r.legend, labels: r.labels, w: r.w, h: r.h, ...parseChartCsv(r.csv) };
-  await insertGenerated(app, chartSvg(data), data.w, data.h, 'chart', data, pos);
+  await insertGenerated(app, chartSvg(data), data.w, data.h, 'chart', data, pin);
 }
 
 // Links ----------------------------------------------------------------------------------------
@@ -577,6 +582,7 @@ def([
       for (let i = $f.depth; i > 0; i--) if ($f.node(i).type === N.text_box) { d = i; break; }
       if (d < 0) { toast('Place the cursor inside a text box.'); return; }
       const node = $f.node(d), pos = $f.before(d);
+      const pin = pinNode(app.state.doc, pos);
       const a = node.attrs;
       const r = await openDialog({ title: 'Format Text Box', fields: [
         { key: 'float', label: 'Position', type: 'select', options: ['none', 'left', 'right'], value: a.float, half: true },
@@ -588,9 +594,12 @@ def([
         { key: 'radius', label: 'Corner radius (pt)', type: 'number', value: a.radius, half: true },
         { key: 'rotate', label: 'Rotation (°)', type: 'number', value: a.rotate, half: true },
         { key: 'shadow', label: 'Shadow', type: 'checkbox', value: a.shadow, half: true },
-      ], buttons: [{ label: 'Remove Box (keep text)', onClick: (_v, ctl) => { v(app).dispatch(app.state.tr.replaceWith(pos, pos + node.nodeSize, node.content)); ctl.close(); } }] });
+      ], buttons: [{ label: 'Remove Box (keep text)', onClick: (_v, ctl) => { const p = findPinned(app.state.doc, pin); if (p >= 0) v(app).dispatch(app.state.tr.replaceWith(p, p + node.nodeSize, node.content)); ctl.close(); } }] });
       if (!r) return;
-      v(app).dispatch(app.state.tr.setNodeMarkup(pos, undefined, { ...a, float: r.float, width: r.width || null, border: r.border || null, bg: r.noFill ? null : r.bg, padding: r.padding, radius: r.radius, rotate: r.rotate, shadow: r.shadow }));
+      // The box may have moved, or been edited, while the dialog was open.
+      const p = findPinned(app.state.doc, pin);
+      if (p < 0) { toast('The text box changed while the dialog was open. Try again.'); return; }
+      v(app).dispatch(app.state.tr.setNodeMarkup(p, undefined, { ...a, float: r.float, width: r.width || null, border: r.border || null, bg: r.noFill ? null : r.bg, padding: r.padding, radius: r.radius, rotate: r.rotate, shadow: r.shadow }));
     },
   },
   {
@@ -663,15 +672,18 @@ def([
       const pos = arg?.pos ?? (app.state.selection instanceof NodeSelection ? app.state.selection.from : -1);
       const node = pos >= 0 ? app.state.doc.nodeAt(pos) : null;
       if (!node || node.type !== N.field) { toast('Select a field first.'); return; }
+      const pin = pinNode(app.state.doc, pos);
       const r = await openDialog({ title: `Edit Field (${node.attrs.type})`, fields: [
         { key: 'type', label: 'Field', type: 'select', options: FIELD_TYPES.map((f) => f.type), value: node.attrs.type },
         { key: 'arg', label: 'Argument', type: 'text', value: node.attrs.arg || '' },
         { key: 'format', label: 'Format', type: 'text', value: node.attrs.format || '' },
         { key: 'value', label: 'Result text (for FILLIN)', type: 'text', value: node.attrs.value || '' },
         { key: 'locked', label: 'Locked', type: 'checkbox', value: node.attrs.locked },
-      ], buttons: [{ label: 'Unlink (convert to text)', onClick: (_v, ctl) => { v(app).dispatch(app.state.tr.replaceWith(pos, pos + 1, schema.text(node.attrs.value || ' '))); ctl.close(); } }] });
+      ], buttons: [{ label: 'Unlink (convert to text)', onClick: (_v, ctl) => { const p = findPinned(app.state.doc, pin); if (p >= 0) v(app).dispatch(app.state.tr.replaceWith(p, p + 1, schema.text(node.attrs.value || ' '))); ctl.close(); } }] });
       if (!r) return;
-      v(app).dispatch(app.state.tr.setNodeMarkup(pos, undefined, { ...node.attrs, type: r.type, arg: r.arg || null, format: r.format || null, value: r.value, locked: r.locked }));
+      const p = findPinned(app.state.doc, pin);
+      if (p < 0) { toast('The field changed while the dialog was open. Try again.'); return; }
+      v(app).dispatch(app.state.tr.setNodeMarkup(p, undefined, { ...node.attrs, type: r.type, arg: r.arg || null, format: r.format || null, value: r.value, locked: r.locked }));
       app.updateFields();
     },
   },
@@ -823,7 +835,9 @@ const EQUATIONS: [string, string][] = [
   ['Taylor expansion', 'e^x=1+\\frac{x}{1!}+\\frac{x^2}{2!}+\\frac{x^3}{3!}+\\cdots'], ['Euler identity', 'e^{i\\pi}+1=0'], ['Integral', '\\int_a^b f(x)\\,dx=F(b)-F(a)'],
   ['Matrix', '\\begin{pmatrix}a & b\\\\ c & d\\end{pmatrix}'], ['Compound interest', 'A=P\\left(1+\\frac{r}{n}\\right)^{nt}'], ['Standard deviation', '\\sigma=\\sqrt{\\frac{1}{N}\\sum_{i=1}^{N}(x_i-\\mu)^2}'],
 ];
-async function equationDialog(app: App, latex: string, display: boolean, pos?: number) {
+async function equationDialog(app: App, latex: string, display: boolean, editPos?: number) {
+  const pin = editPos != null ? pinNode(app.state.doc, editPos) : undefined;
+  const pos = editPos;
   const r = await openDialog({
     title: pos != null ? 'Edit Equation' : 'Insert Equation', wide: true, preview: true, ok: pos != null ? 'Update' : 'Insert',
     fields: [
@@ -835,8 +849,10 @@ async function equationDialog(app: App, latex: string, display: boolean, pos?: n
   });
   if (!r || !r.latex) return;
   const view = v(app);
-  if (pos != null) {
-    const node = view.state.doc.nodeAt(pos);
+  // The equation being edited, where it is now; if it is gone, a new one is inserted.
+  const at = pin ? findPinned(view.state.doc, pin) : -1;
+  if (at >= 0) {
+    const pos = at, node = view.state.doc.nodeAt(pos);
     if (node && (node.type === N.math_inline || node.type === N.math_block)) {
       if ((node.type === N.math_block) === !!r.display) view.dispatch(view.state.tr.setNodeMarkup(pos, undefined, { ...node.attrs, latex: r.latex }));
       else view.dispatch(view.state.tr.replaceWith(pos, pos + node.nodeSize, r.display ? N.math_block.create({ latex: r.latex }) : N.math_inline.create({ latex: r.latex })));

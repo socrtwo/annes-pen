@@ -195,15 +195,21 @@ def([
   {
     id: 'edit.selectSimilar', label: 'Select Text with Similar Formatting', icon: 'select', tab: 'Home', group: 'Editing',
     run: async (app, arg) => {
-      const st = app.state;
-      const style = arg?.style || currentParagraph(st)?.attrs.style || 'Normal';
-      const ranges: { from: number; to: number }[] = [];
-      st.doc.descendants((n, pos) => { if (n.type === N.paragraph && (n.attrs.style || 'Normal') === style) { ranges.push({ from: pos + 1, to: pos + n.nodeSize - 1 }); return false; } return true; });
+      const style = arg?.style || currentParagraph(app.state)?.attrs.style || 'Normal';
+      const find = (d: PMNode) => {
+        const out: { from: number; to: number }[] = [];
+        d.descendants((n, pos) => { if (n.type === N.paragraph && (n.attrs.style || 'Normal') === style) { out.push({ from: pos + 1, to: pos + n.nodeSize - 1 }); return false; } return true; });
+        return out;
+      };
+      let ranges = find(app.state.doc);
       const r = await openDialog({ title: 'Select Similar Formatting', help: `${ranges.length} paragraph(s) use the style "${style}". Choose what to do with all of them:`, fields: [
         { key: 'act', label: 'Action', type: 'radio', options: [{ value: 'style', label: 'Apply another style' }, { value: 'clear', label: 'Clear direct formatting' }, { value: 'highlight', label: 'Highlight them' }, { value: 'delete', label: 'Delete them' }, { value: 'copy', label: 'Copy their text to clipboard' }], value: 'style' },
         { key: 'style', label: 'Style', type: 'text', value: 'Normal', visibleIf: (x) => x.act === 'style' },
       ] });
       if (!r) return;
+      // The paragraphs as they are now: the document may have changed while the dialog was open.
+      const st = app.state;
+      ranges = find(st.doc);
       const tr = st.tr;
       const sorted = [...ranges].sort((a, b) => b.from - a.from);
       for (const rg of sorted) {

@@ -4,7 +4,11 @@ import { DEFAULT_AUTOFORMAT, DEFAULT_REPLACEMENTS, type AutoFormatPrefs } from '
 export interface CustomGroup { id: string; label: string; items: string[] }
 export interface CustomTab { id: string; label: string; groups: CustomGroup[]; hidden?: boolean }
 export interface RecentEntry { key: string; name: string; when: number; uri?: string; format?: string; pinned?: boolean }
-export interface Macro { name: string; steps: { id: string; arg?: any }[]; description?: string; key?: string; created: number }
+export interface Macro {
+  name: string; steps: { id: string; arg?: any }[]; description?: string; key?: string; created: number;
+  /** An imported script macro: asks before it first runs. */
+  untrusted?: boolean;
+}
 export interface Snippet { name: string; gallery: string; json: any; created: number }
 
 export interface Prefs {
@@ -165,6 +169,33 @@ export function sanitizePrefs(raw: unknown): Partial<Prefs> {
   if (out.macros) out.macros = out.macros.filter((m: any) => isObj(m) && typeof m.name === 'string' && Array.isArray(m.steps) && m.steps.every((s: any) => isObj(s) && typeof s.id === 'string'));
   if (out.snippets) out.snippets = out.snippets.filter((s: any) => isObj(s) && typeof s.name === 'string');
   return out as Partial<Prefs>;
+}
+
+export const PREFS_KEY = KEY;
+
+/**
+ * Preferences saved by another window (the storage event) merged into this window's: lists that only
+ * grow (Recent, dictionary, ignored words, building blocks, macros) keep the entries of both, and every
+ * other preference takes the other window's value, so neither window's last save drops the other's additions.
+ */
+export function mergePrefs(local: Prefs, raw: unknown): Prefs {
+  const remote = sanitizePrefs(raw);
+  const out: Prefs = { ...local, ...remote, autoformat: { ...local.autoformat, ...(remote.autoformat || {}) } };
+  const byKey = <T>(a: T[], b: T[], key: (x: T) => string, newer: (x: T, y: T) => boolean): T[] => {
+    const m = new Map<string, T>();
+    for (const x of [...a, ...b]) { const k = key(x); const cur = m.get(k); if (!cur || newer(x, cur)) m.set(k, x); }
+    return [...m.values()];
+  };
+  if (remote.recent) {
+    const list = byKey(local.recent, remote.recent, (r) => r.key, (x, y) => x.when > y.when).sort((a, b) => b.when - a.when);
+    out.recent = [...list.filter((r) => r.pinned), ...list.filter((r) => !r.pinned)].slice(0, 40);
+  }
+  if (remote.dictionary) out.dictionary = [...new Set([...local.dictionary, ...remote.dictionary])];
+  if (remote.ignoredWords) out.ignoredWords = [...new Set([...local.ignoredWords, ...remote.ignoredWords])];
+  if (remote.snippets) out.snippets = byKey(local.snippets, remote.snippets, (x) => x.name, (x, y) => (x.created || 0) > (y.created || 0));
+  // The other window's copy of a macro is its latest (edited there, or its untrusted mark cleared there).
+  if (remote.macros) out.macros = byKey(local.macros, remote.macros, (x) => x.name, () => true);
+  return out;
 }
 
 export function savePrefs(p: Prefs): void {

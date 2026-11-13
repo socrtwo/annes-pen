@@ -20,16 +20,19 @@ export function parseCsv(text: string): string[][] {
   const count = (re: RegExp) => (head.match(re) || []).length;
   const delim = count(/\t/g) > count(/,/g) ? '\t' : count(/;/g) > count(/,/g) ? ';' : ',';
   const rows: string[][] = [];
-  let row: string[] = [], cell = '', q = false;
+  // after: just past a closing quote, where blanks before the next delimiter are dropped.
+  let row: string[] = [], cell = '', q = false, after = false;
+  const blank = (c: string) => c === ' ' || (c === '\t' && delim !== '\t');
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (q) {
       if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; }
-      else if (c === '"') q = false;
+      else if (c === '"') { q = false; after = true; }
       else cell += c;
-    } else if (c === '"' && cell === '') q = true;
-    else if (c === delim) { row.push(cell); cell = ''; }
-    else if (c === '\n' || c === '\r') { if (c === '\r' && text[i + 1] === '\n') i++; row.push(cell); rows.push(row); row = []; cell = ''; }
+    } else if (c === '"' && !after && !cell.trim()) { q = true; cell = ''; } // blanks before an opening quote are not text
+    else if (c === delim) { row.push(cell); cell = ''; after = false; }
+    else if (c === '\n' || c === '\r') { if (c === '\r' && text[i + 1] === '\n') i++; row.push(cell); rows.push(row); row = []; cell = ''; after = false; }
+    else if (after && blank(c)) continue;
     else cell += c;
   }
   if (cell || row.length) { row.push(cell); rows.push(row); }
@@ -37,7 +40,8 @@ export function parseCsv(text: string): string[][] {
 }
 
 export function toCsv(fields: string[], rows: string[][]): string {
-  const q = (s: string) => (/[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
+  // Quoted when it holds any delimiter parseCsv might choose, a line break, or blanks at either end.
+  const q = (s: string) => (/[",;\t\n\r]|^\s|\s$/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
   return [fields.map(q).join(','), ...rows.map((r) => r.map((x) => q(x ?? '')).join(','))].join('\n');
 }
 

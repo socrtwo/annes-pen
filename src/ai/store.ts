@@ -87,7 +87,7 @@ export function saveAiSettings(mut?: (s: AiSettings) => void): void {
   const s = aiSettings();
   mut?.(s);
   try { localStorage.setItem(KEY, JSON.stringify(s)); } catch { /* quota */ }
-  try { new BroadcastChannel('quillpen-ai').postMessage({ type: 'settings' }); } catch { /* unsupported */ }
+  try { channel()?.postMessage({ type: 'settings', from: WINDOW_ID }); } catch { /* unsupported */ }
   listeners.forEach((f) => f());
 }
 
@@ -104,13 +104,21 @@ export function reloadAiSettings(): void {
 
 // Settings changed in another tab (e.g. the OAuth callback tab): reload. Browser only, and unref'd so
 // tooling that imports this module under Node can exit.
-if (typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined') {
+// One channel per window; a window's own messages are ignored (it has already applied them).
+const WINDOW_ID = Math.random().toString(36).slice(2);
+let bc: BroadcastChannel | null | undefined;
+function channel(): BroadcastChannel | null {
+  if (bc !== undefined) return bc;
+  bc = null;
+  if (typeof window === 'undefined' || typeof BroadcastChannel === 'undefined') return bc;
   try {
-    const bc = new BroadcastChannel('quillpen-ai');
-    bc.onmessage = () => reloadAiSettings();
+    bc = new BroadcastChannel('quillpen-ai'); // rename:keep — other windows of older versions listen here
+    bc.onmessage = (e) => { if (e.data?.from !== WINDOW_ID) reloadAiSettings(); };
     (bc as unknown as { unref?: () => void }).unref?.();
   } catch { /* unsupported */ }
+  return bc;
 }
+channel();
 
 // ------------------------------------------------------------------------------------------
 // Keys

@@ -71,6 +71,25 @@ let dialogDepth = 0;
 /** Open dialogs, innermost last: only the top one handles Escape and Enter. */
 const dialogStack: HTMLElement[] = [];
 
+/** Elements made inert while a dialog is open (the app, and dialogs under the top one). */
+const madeInert = new Set<HTMLElement>();
+function updateInert(): void {
+  const top = dialogStack[dialogStack.length - 1];
+  const want = new Set<HTMLElement>();
+  if (top) {
+    for (const el of document.querySelectorAll<HTMLElement>('#app, .qf-app')) if (!el.closest('.qf-overlay')) want.add(el);
+    for (const o of dialogStack) if (o !== top) want.add(o);
+  }
+  for (const el of [...madeInert]) if (!want.has(el)) { el.inert = false; el.removeAttribute('inert'); madeInert.delete(el); }
+  for (const el of want) if (!el.inert && !madeInert.has(el)) { el.inert = true; el.setAttribute('inert', ''); madeInert.add(el); }
+}
+
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]):not([type=hidden]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"]), [contenteditable="true"]';
+/** Focusable elements of a dialog, in order, that are shown. */
+export function focusables(box: HTMLElement): HTMLElement[] {
+  return [...box.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((el) => !el.closest('[inert]') && !el.closest('[style*="display: none"]') && el.getAttribute('aria-hidden') !== 'true');
+}
+
 export function openDialog(opts: DialogOptions): Promise<Record<string, any> | null> {
   return new Promise((resolve) => {
     dialogDepth++;
@@ -136,7 +155,10 @@ export function openDialog(opts: DialogOptions): Promise<Record<string, any> | n
       overlay.classList.add('qf-out');
       setTimeout(() => overlay.remove(), 120);
       document.removeEventListener('keydown', onKey, true);
-      prevFocus?.focus?.();
+      document.removeEventListener('focusin', onFocusIn, true);
+      // The app (or the dialog below) is interactive again before focus goes back to it.
+      updateInert();
+      if (prevFocus && prevFocus.isConnected) prevFocus.focus?.();
       resolve(result);
     }
     const onKey = (e: KeyboardEvent) => {
@@ -144,10 +166,26 @@ export function openDialog(opts: DialogOptions): Promise<Record<string, any> | n
       // Shortcut capture boxes (Customize Keyboard) take Enter and modified keys themselves; plain Escape still closes.
       const plainEsc = e.key === 'Escape' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey;
       if ((e.target as HTMLElement | null)?.closest?.('[data-capture-keys]') && !plainEsc) return;
+      // Tab and Shift+Tab stay within the dialog.
+      if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        const list = focusables(box);
+        if (!list.length) { e.preventDefault(); return; }
+        const i = list.indexOf(document.activeElement as HTMLElement);
+        if (e.shiftKey && i <= 0) { e.preventDefault(); list[list.length - 1].focus(); }
+        else if (!e.shiftKey && (i < 0 || i === list.length - 1)) { e.preventDefault(); list[0].focus(); }
+        return;
+      }
       if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); finish(null); }
       if (e.key === 'Enter' && !(e.target instanceof HTMLTextAreaElement) && !(e.target instanceof HTMLButtonElement) && opts.ok !== false) {
         e.preventDefault(); e.stopImmediatePropagation(); okClick();
       }
+    };
+    // Focus that lands outside the top dialog (a click on the page behind, a script) comes back into it.
+    const onFocusIn = (e: FocusEvent) => {
+      if (dialogStack[dialogStack.length - 1] !== overlay) return;
+      const t = e.target as HTMLElement | null;
+      if (!t || overlay.contains(t) || t.closest?.('.qf-menu, .qf-toasts, .qf-overlay')) return;
+      (focusables(box)[0] || box).focus?.();
     };
     const okClick = () => {
       const v = values();
@@ -172,7 +210,9 @@ export function openDialog(opts: DialogOptions): Promise<Record<string, any> | n
     overlay.addEventListener('mousedown', (e) => { if (e.target === overlay && !isPhone()) finish(null); });
     document.body.appendChild(overlay);
     dialogStack.push(overlay);
+    updateInert();
     document.addEventListener('keydown', onKey, true);
+    document.addEventListener('focusin', onFocusIn, true);
     build();
     opts.onOpen?.(ctl);
     opts.onChange?.(values(), ctl, '');
