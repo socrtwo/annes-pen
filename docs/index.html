@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0f0322">
+<title>socrtwo project</title>
+<!--
+  Generic project landing page. It works out the repository from its own
+  address (https://OWNER.github.io/REPO/) and shows that repository's
+  description and README, fetched from the GitHub API when the page loads.
+  The same file works unchanged in any repository: put it in docs/ and
+  publish GitHub Pages from the docs folder. Nothing here needs editing
+  when the README changes.
+-->
+<style>
+  :root{color-scheme:dark;--fg:#f5f3ff;--dim:rgba(245,243,255,.68);--line:rgba(255,255,255,.12);--card:rgba(20,10,40,.6);--accent:#22d3ee;--violet:#7c3aed;--pink:#ff2e93}
+  *,*::before,*::after{box-sizing:border-box}
+  body{margin:0;font-family:Inter,-apple-system,system-ui,sans-serif;background:radial-gradient(ellipse at top,#0f0322 0%,#08010f 70%) fixed;color:var(--fg);line-height:1.6;-webkit-font-smoothing:antialiased}
+  main{max-width:860px;margin:0 auto;padding:40px 16px 72px}
+  header{text-align:center;margin-bottom:28px}
+  h1{font-size:clamp(1.9rem,6vw,2.8rem);font-weight:800;letter-spacing:-.02em;margin:0 0 8px;overflow-wrap:anywhere;background:linear-gradient(135deg,var(--pink),var(--accent));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  .tagline{color:var(--dim);font-size:1.05rem;max-width:640px;margin:0 auto;min-height:1.6em}
+  .meta{display:flex;flex-wrap:wrap;justify-content:center;gap:6px 16px;margin-top:12px;font-size:.82rem;color:var(--dim)}
+  .actions{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;margin:22px 0 0}
+  .btn{padding:10px 18px;border-radius:12px;text-decoration:none;font-size:.9rem;font-weight:600;color:var(--fg);background:rgba(255,255,255,.06);border:1px solid var(--line)}
+  .btn:hover,.btn:focus-visible{border-color:var(--violet);background:rgba(124,58,237,.25)}
+  .btn.primary{background:linear-gradient(135deg,var(--pink),var(--violet));border-color:transparent}
+  .doc{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px clamp(16px,4vw,34px);overflow-wrap:anywhere}
+  .doc h1,.doc h2,.doc h3,.doc h4{line-height:1.25;margin:1.5em 0 .5em}
+  .doc h1{font-size:1.6rem;background:none;-webkit-text-fill-color:currentColor}
+  .doc h2{font-size:1.3rem;padding-bottom:.3em;border-bottom:1px solid var(--line)}
+  .doc h3{font-size:1.1rem}
+  .doc>:first-child,article>div>:first-child{margin-top:0}
+  .doc a{color:var(--accent)}
+  .doc img{max-width:100%;height:auto}
+  .doc pre{background:rgba(0,0,0,.45);border:1px solid var(--line);border-radius:10px;padding:12px 14px;overflow-x:auto;font-size:.85rem;line-height:1.45}
+  .doc code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9em;background:rgba(255,255,255,.08);padding:.1em .35em;border-radius:5px}
+  .doc pre code{background:none;padding:0;font-size:inherit}
+  .doc table{display:block;overflow-x:auto;border-collapse:collapse;margin:1em 0}
+  .doc th,.doc td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top}
+  .doc blockquote{margin:1em 0;padding:.2em 1em;border-left:3px solid var(--violet);color:var(--dim)}
+  .doc hr{border:0;border-top:1px solid var(--line);margin:1.5em 0}
+  .doc .anchor,.doc .octicon{display:none}
+  .note{color:var(--dim);font-style:italic}
+  footer{margin-top:36px;text-align:center;color:var(--dim);font-size:.82rem}
+  footer a{color:var(--fg)}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="name">Project</h1>
+    <p class="tagline" id="desc"></p>
+    <div class="meta" id="meta"></div>
+    <nav class="actions" id="actions" aria-label="Project links"></nav>
+  </header>
+  <article class="doc" id="readme" aria-live="polite"><p class="note">Loading the project description…</p></article>
+  <footer>
+    <a id="all" href="#">All socrtwo projects</a> · This page shows the repository's README, fetched live from GitHub.
+  </footer>
+</main>
+<noscript><p style="text-align:center">This page needs JavaScript to load the project description from GitHub.</p></noscript>
+<script>
+(function () {
+  // https://OWNER.github.io/REPO/...  ->  OWNER, REPO.  ?repo=OWNER/REPO overrides (for local testing).
+  var override = new URLSearchParams(location.search).get('repo') || '';
+  var host = location.hostname.match(/^([a-z0-9-]+)\.github\.io$/i);
+  var owner = override.split('/')[0] || (host ? host[1] : '');
+  var repo = override.split('/')[1] || decodeURIComponent(location.pathname.split('/')[1] || '');
+  var ok = /^[A-Za-z0-9-]+$/.test(owner) && /^[A-Za-z0-9._-]+$/.test(repo);
+  var $ = function (id) { return document.getElementById(id); };
+  var gh = 'https://github.com/' + owner + '/' + repo;
+  var api = 'https://api.github.com/repos/' + owner + '/' + repo;
+
+  function link(text, href, primary) {
+    var a = document.createElement('a');
+    a.className = 'btn' + (primary ? ' primary' : '');
+    a.textContent = text; a.href = href; a.rel = 'noopener';
+    $('actions').appendChild(a);
+  }
+  function fail(message) {
+    var p = document.createElement('p'); p.className = 'note'; p.textContent = message + ' ';
+    if (ok) { var a = document.createElement('a'); a.href = gh + '#readme'; a.textContent = 'Read it on GitHub.'; p.appendChild(a); }
+    $('readme').replaceChildren(p);
+  }
+
+  if (!ok) { fail('This page could not work out which repository it belongs to.'); return; }
+  $('name').textContent = repo; document.title = repo + ' · ' + owner;
+  $('all').href = 'https://' + owner + '.github.io/' + owner + '/';
+  link('Source on GitHub', gh, true);
+
+  fetch(api).then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); }).then(function (d) {
+    $('desc').textContent = d.description || '';
+    var bits = [];
+    if (d.language) bits.push(d.language);
+    if (d.license && d.license.spdx_id && d.license.spdx_id !== 'NOASSERTION') bits.push(d.license.spdx_id + ' license');
+    if (d.pushed_at) bits.push('updated ' + new Date(d.pushed_at).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }));
+    bits.forEach(function (t) { var s = document.createElement('span'); s.textContent = t; $('meta').appendChild(s); });
+    if (d.has_issues) link('Issues', gh + '/issues');
+    link('Download ZIP', gh + '/archive/refs/heads/' + encodeURIComponent(d.default_branch || 'main') + '.zip');
+    var m = document.createElement('meta'); m.name = 'description'; m.content = d.description || repo; document.head.appendChild(m);
+  }).catch(function () { /* the header simply stays minimal */ });
+
+  // GitHub renders and sanitises the README; we only repoint its relative links.
+  fetch(api + '/readme', { headers: { Accept: 'application/vnd.github.html' } })
+    .then(function (r) { return r.ok ? r.text() : Promise.reject(r.status); })
+    .then(function (html) {
+      var doc = new DOMParser().parseFromString(html, 'text/html');
+      var relative = function (u) { return u && !/^([a-z][a-z0-9+.-]*:|\/\/|#)/i.test(u); };
+      var clean = function (u) { return u.replace(/^\.?\//, ''); };
+      doc.querySelectorAll('a[href]').forEach(function (a) {
+        var h = a.getAttribute('href');
+        if (relative(h)) a.setAttribute('href', gh + '/blob/HEAD/' + clean(h));
+        if (!h.startsWith('#')) a.rel = 'noopener';
+      });
+      doc.querySelectorAll('img[src]').forEach(function (i) {
+        var s = i.getAttribute('src');
+        if (relative(s)) i.setAttribute('src', 'https://raw.githubusercontent.com/' + owner + '/' + repo + '/HEAD/' + clean(s));
+        i.loading = 'lazy';
+      });
+      doc.querySelectorAll('script,style,iframe,object,embed,form').forEach(function (n) { n.remove(); });
+      doc.querySelectorAll('[id]').forEach(function (n) { n.removeAttribute('id'); });   // keep ours unique
+      $('readme').replaceChildren.apply($('readme'), Array.from(doc.body.childNodes));
+      var first = $('readme').querySelector('h1');           // the page header already shows the name
+      if (first && first.textContent.trim().toLowerCase() === repo.toLowerCase().replace(/[-_]/g, ' ')) first.remove();
+    })
+    .catch(function (status) {
+      fail(status === 404 ? 'This repository has no README yet.'
+        : status === 403 ? 'GitHub is limiting requests from your network right now, so the description could not be loaded.'
+        : 'The description could not be loaded.');
+    });
+})();
+</script>
+</body>
+</html>
